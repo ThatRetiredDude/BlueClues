@@ -38,7 +38,6 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
     private let locationManager = CLLocationManager()
     private var wantsScanning = false
     private var mode: ScanMode = .inMotion
-    private var isInBackground = false
 
     weak var delegate: ScanEngineDelegate?
 
@@ -63,8 +62,8 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(appDidEnterBackground),
                            name: UIApplication.didEnterBackgroundNotification, object: nil)
-        center.addObserver(self, selector: #selector(appWillEnterForeground),
-                           name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(appDidBecomeActive),
+                           name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
     // MARK: Control
@@ -102,7 +101,9 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
     private func restartScan() {
         guard wantsScanning, centralManager.state == .poweredOn else { return }
         if centralManager.isScanning { centralManager.stopScan() }
-        if isInBackground {
+        // Ask UIKit rather than tracking a flag: a state-restoration relaunch
+        // can bring the app to the foreground without any transition event.
+        if UIApplication.shared.applicationState == .background {
             // In the background iOS only delivers peripherals advertising a
             // requested service, and coalesces duplicates.
             let services = TrackerSignatures.backgroundScanServices.map { CBUUID(string: $0) }
@@ -146,12 +147,10 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
     }
 
     @objc private func appDidEnterBackground() {
-        isInBackground = true
         restartScan()
     }
 
-    @objc private func appWillEnterForeground() {
-        isInBackground = false
+    @objc private func appDidBecomeActive() {
         restartScan()
     }
 
@@ -166,7 +165,6 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
         // iOS relaunched us for a background Bluetooth event; resume scanning
         // once the manager reports poweredOn.
         wantsScanning = true
-        isInBackground = true
     }
 
     func centralManager(_ central: CBCentralManager,
