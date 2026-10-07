@@ -20,6 +20,7 @@ struct Advertisement {
     let latitude: Double?
     let longitude: Double?
     let tracker: TrackerMatch?
+    let signature: AdvertisementSignature?
     let summary: String
 }
 
@@ -169,6 +170,13 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
                                                  serviceUUIDs: serviceUUIDs,
                                                  serviceData: serviceData)
 
+        let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let signature = AdvertisementSignature.make(
+            manufacturerData: manufacturerData,
+            serviceUUIDs: serviceUUIDs,
+            hasLocalName: !(localName ?? "").isEmpty,
+            txPower: (advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber)?.intValue)
+
         var summaryParts: [String] = []
         if let manufacturerData { summaryParts.append("mfr=\(manufacturerData.map { String(format: "%02X", $0) }.joined())") }
         if !serviceUUIDs.isEmpty { summaryParts.append("services=\(serviceUUIDs.joined(separator: ","))") }
@@ -176,12 +184,13 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
 
         let advertisement = Advertisement(
             peripheralID: peripheral.identifier.uuidString,
-            name: peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+            name: peripheral.name ?? localName,
             rssi: rssi,
             time: Date(),
             latitude: lastLocation?.coordinate.latitude,
             longitude: lastLocation?.coordinate.longitude,
             tracker: tracker,
+            signature: signature,
             summary: summaryParts.joined(separator: " ")
         )
         delegate?.scanEngine(self, didReceive: advertisement)

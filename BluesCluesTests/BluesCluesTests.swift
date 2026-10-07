@@ -219,3 +219,122 @@ final class AlertPolicyTests: XCTestCase {
         XCTAssertTrue(AlertPolicy.isEligible(trust: .unknown, isTracker: true, scope: .trackersOnly))
     }
 }
+
+final class AdvertisementSignatureTests: XCTestCase {
+    func testAppleSignatureIgnoresRotatingPayload() {
+        let a = AdvertisementSignature.make(manufacturerData: Data([0x4C, 0x00, 0x10, 0x05, 0x01, 0x18, 0xAA]),
+                                            serviceUUIDs: [], hasLocalName: false, txPower: 12)
+        let b = AdvertisementSignature.make(manufacturerData: Data([0x4C, 0x00, 0x10, 0x05, 0x03, 0x1C, 0x42]),
+                                            serviceUUIDs: [], hasLocalName: false, txPower: 12)
+        XCTAssertNotNil(a)
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a?.companyID, 0x004C)
+        XCTAssertEqual(a?.appleMessageType, 0x10)
+        XCTAssertEqual(a?.displayName, "Apple device (Nearby Info)")
+    }
+
+    func testDifferentAppleMessageTypesDiffer() {
+        let nearby = AdvertisementSignature.make(manufacturerData: Data([0x4C, 0x00, 0x10, 0x05]), serviceUUIDs: [], hasLocalName: false, txPower: nil)
+        let airpods = AdvertisementSignature.make(manufacturerData: Data([0x4C, 0x00, 0x07, 0x19]), serviceUUIDs: [], hasLocalName: false, txPower: nil)
+        XCTAssertNotEqual(nearby?.key, airpods?.key)
+    }
+
+    func testServicesAreSortedAndUppercased() {
+        let a = AdvertisementSignature.make(manufacturerData: nil, serviceUUIDs: ["fe9f", "180F"], hasLocalName: true, txPower: nil)
+        let b = AdvertisementSignature.make(manufacturerData: nil, serviceUUIDs: ["180F", "FE9F"], hasLocalName: true, txPower: nil)
+        XCTAssertEqual(a?.services, ["180F", "FE9F"])
+        XCTAssertEqual(a?.key, b?.key)
+    }
+
+    func testNameAndTxPowerAreParts() {
+        let base = AdvertisementSignature.make(manufacturerData: Data([0x06, 0x00, 0x01]), serviceUUIDs: [], hasLocalName: false, txPower: nil)
+        let named = AdvertisementSignature.make(manufacturerData: Data([0x06, 0x00, 0x01]), serviceUUIDs: [], hasLocalName: true, txPower: nil)
+        let powered = AdvertisementSignature.make(manufacturerData: Data([0x06, 0x00, 0x01]), serviceUUIDs: [], hasLocalName: false, txPower: 4)
+        XCTAssertNotEqual(base?.key, named?.key)
+        XCTAssertNotEqual(base?.key, powered?.key)
+    }
+
+    func testEmptyAdvertisementHasNoSignature() {
+        XCTAssertNil(AdvertisementSignature.make(manufacturerData: nil, serviceUUIDs: [], hasLocalName: true, txPower: 8))
+    }
+}
+
+final class LookalikeTrackerTests: XCTestCase {
+    private let start = Date(timeIntervalSince1970: 1_700_000_000)
+    private let sig = "c004C|t10|s|n0|p-"
+
+    private func record(_ tracker: inout LookalikeTracker, _ minutes: Double, _ lat: Double, peripheral: String) {
+        tracker.record(signature: sig, peripheralID: peripheral, time: start.addingTimeInterval(minutes * 60),
+                       latitude: lat, longitude: -75.0)
+    }
+
+    func testRotatingAddressesAtThreePlacesAreFlagged() {
+        var tracker = LookalikeTracker()
+        record(&tracker, 0, 40.000, peripheral: "A")
+        record(&tracker, 6, 40.009, peripheral: "B")
+        record(&tracker, 12, 40.018, peripheral: "C")
+        let result = tracker.assess(sig, now: start.addingTimeInterval(12 * 60))
+        XCTAssertTrue(result.isSuspicious)
+        XCTAssertTrue(result.reason.contains("3 of your locations over 12 min"))
+    }
+
+    func testTwoPlacesAreNotEnough() {
+        var tracker = LookalikeTracker()
+        record(&tracker, 0, 40.000, peripheral: "A")
+        record(&tracker, 12, 40.009, peripheral: "B")
+        XCTAssertFalse(tracker.assess(sig, now: start.addingTimeInterval(12 * 60)).isSuspicious)
+    }
+
+    func testThreePlacesTooQuicklyAreNotEnough() {
+        var tracker = LookalikeTracker()
+        record(&tracker, 0, 40.000, peripheral: "A")
+        record(&tracker, 2, 40.009, peripheral: "B")
+        record(&tracker, 4, 40.018, peripheral: "C")
+        XCTAssertFalse(tracker.assess(sig, now: start.addingTimeInterval(4 * 60)).isSuspicious)
+    }
+
+    func testCrowdSignatureIsIgnored() {
+        var tracker = LookalikeTracker()
+        // Six different phones with the same signature within one minute.
+        for i in 0..<6 {
+            tracker.record(signature: sig, peripheralID: "crowd-\(i)", time: start.addingTimeInterval(Double(i) * 5),
+                           latitude: 40.0, longitude: -75.0)
+        }
+        XCTAssertTrue(tracker.isCrowd(sig, now: start.addingTimeInterval(60)))
+        record(&tracker, 6, 40.009, peripheral: "B")
+        record(&tracker, 12, 40.018, peripheral: "C")
+        XCTAssertFalse(tracker.assess(sig, now: start.addingTimeInterval(12 * 60)).isSuspicious)
+    }
+
+    func testFiveAtOnceIsNotACrowd() {
+        var tracker = LookalikeTracker()
+        for i in 0..<5 {
+            tracker.record(signature: sig, peripheralID: "p-\(i)", time: start, latitude: 40.0, longitude: -75.0)
+        }
+        XCTAssertFalse(tracker.isCrowd(sig, now: start))
+    }
+
+    func testSignatureSeenOnlyFromTrustedDevicesIsSkipped() {
+        var tracker = LookalikeTracker()
+        record(&tracker, 0, 40.000, peripheral: "mine")
+        record(&tracker, 6, 40.009, peripheral: "mine")
+        record(&tracker, 12, 40.018, peripheral: "mine")
+        let now = start.addingTimeInterval(12 * 60)
+        XCTAssertFalse(tracker.assess(sig, now: now, isTrusted: { $0 == "mine" }).isSuspicious)
+        XCTAssertTrue(tracker.assess(sig, now: now, isTrusted: { _ in false }).isSuspicious)
+    }
+
+    func testRecordIsThrottled() {
+        var tracker = LookalikeTracker()
+        XCTAssertTrue(tracker.record(signature: sig, peripheralID: "A", time: start, latitude: 40, longitude: -75))
+        XCTAssertFalse(tracker.record(signature: sig, peripheralID: "A", time: start.addingTimeInterval(5), latitude: 40, longitude: -75))
+        XCTAssertTrue(tracker.record(signature: sig, peripheralID: "A", time: start.addingTimeInterval(20), latitude: 40, longitude: -75))
+    }
+
+    func testPruneDropsOldObservations() {
+        var tracker = LookalikeTracker()
+        record(&tracker, 0, 40.0, peripheral: "A")
+        tracker.prune(now: start.addingTimeInterval(7 * 60 * 60))
+        XCTAssertNil(tracker.observations[sig])
+    }
+}

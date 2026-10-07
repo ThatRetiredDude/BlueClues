@@ -36,6 +36,16 @@ struct LiveDevice: Identifiable, Equatable {
     var isSuspicious: Bool { assessment.isSuspicious && trust.canAlert }
 }
 
+// MARK: - Possible Follower
+/// A signature (not a single address) that keeps showing up where you go.
+struct PossibleFollower: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    var rssi: Int
+    var lastSeen: Date
+    var assessment: FollowAssessment
+}
+
 // MARK: - Device Service
 final class DeviceService: ScanEngineDelegate, ObservableObject {
     // MARK: Published state
@@ -43,6 +53,8 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     /// Snapshot of `liveStore`, published at most twice a second so busy
     /// places don't redraw the UI on every advertisement.
     @Published private(set) var liveDevices: [String: LiveDevice] = [:]
+    /// Address-rotating devices whose signature looks like it is following you.
+    @Published private(set) var possibleFollowers: [PossibleFollower] = []
     @Published private(set) var bluetoothState: CBManagerState = .unknown
     @Published private(set) var locationAuthorization: CLAuthorizationStatus = .notDetermined
     @Published var mode: ScanMode {
@@ -79,6 +91,10 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     private var departed: Set<String> = []
     private var housekeepingTimer: Timer?
     private var config = DetectorConfig()
+    private var lookalikes = LookalikeTracker()
+    private var lookalikeStore: [String: PossibleFollower] = [:] {
+        didSet { scheduleLiveFlush() }
+    }
 
     /// One stored detection per entity per this interval.
     private let persistInterval: TimeInterval = 15
@@ -216,6 +232,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         }
 
         liveStore[id] = entry
+        trackLookalike(advertisement, entityID: id)
         guard isAlertEligible(entry) else { return }
         if entry.isSuspicious {
             raiseAlertIfNeeded(for: entry)
@@ -302,6 +319,63 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         }
     }
 
+    // MARK: Lookalikes
+    private func trackLookalike(_ advertisement: Advertisement, entityID: String) {
+        guard advertisement.tracker == nil, let signature = advertisement.signature else { return }
+        let key = signature.key
+        let stored = lookalikes.record(signature: key, peripheralID: entityID, time: advertisement.time,
+                                       latitude: advertisement.latitude, longitude: advertisement.longitude)
+        var follower = lookalikeStore[key] ?? PossibleFollower(
+            id: key, displayName: signature.displayName, rssi: advertisement.rssi,
+            lastSeen: advertisement.time,
+            assessment: FollowAssessment(isSuspicious: false, score: 0, reason: "Just seen"))
+        follower.rssi = advertisement.rssi
+        follower.lastSeen = advertisement.time
+        guard stored else {
+            lookalikeStore[key] = follower
+            return
+        }
+        follower.assessment = assessLookalike(key, now: advertisement.time)
+        lookalikeStore[key] = follower
+        if follower.assessment.isSuspicious && lookalikeAlertsEnabled {
+            raiseLookalikeAlertIfNeeded(for: follower)
+        }
+    }
+
+    private func assessLookalike(_ key: String, now: Date) -> FollowAssessment {
+        lookalikes.assess(key, now: now) { [weak self] peripheral in
+            guard let self else { return false }
+            let trust = self.liveStore[peripheral]?.trust ?? .unknown
+            return trust == .mine || trust == .friendly
+        }
+    }
+
+    /// Only in-motion mode, and only when alerting on all unknown devices.
+    private var lookalikeAlertsEnabled: Bool {
+        mode == .inMotion && alertScope == .allUnknown
+    }
+
+    var activePossibleFollowers: [PossibleFollower] {
+        guard lookalikeAlertsEnabled else { return [] }
+        return possibleFollowers
+            .filter { $0.assessment.isSuspicious && Date().timeIntervalSince($0.lastSeen) < departureThreshold }
+            .sorted { $0.assessment.score > $1.assessment.score }
+    }
+
+    private func raiseLookalikeAlertIfNeeded(for follower: PossibleFollower) {
+        let alertKey = "lookalike-\(follower.id)"
+        let now = Date()
+        if let last = lastAlerted[alertKey], now.timeIntervalSince(last) < realertInterval { return }
+        lastAlerted[alertKey] = now
+
+        let content = UNMutableNotificationContent()
+        content.title = "Possible follower nearby"
+        content.body = "\(follower.displayName): \(follower.assessment.reason). This is weaker evidence than a tracker match."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: alertKey, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: Alerts
     private func raiseAlertIfNeeded(for device: LiveDevice, reason: String? = nil) {
         let reason = reason ?? device.assessment.reason
@@ -337,6 +411,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             guard let self else { return }
             self.liveFlushScheduled = false
             self.liveDevices = self.liveStore
+            self.possibleFollowers = Array(self.lookalikeStore.values)
         }
     }
 
@@ -360,6 +435,15 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         }
         for id in sightings.keys {
             sightings[id]?.removeAll { now.timeIntervalSince($0.time) > config.maxLookback }
+        }
+        lookalikes.prune(now: now)
+        for (key, var follower) in lookalikeStore {
+            if lookalikes.observations[key] == nil {
+                lookalikeStore[key] = nil
+            } else {
+                follower.assessment = assessLookalike(key, now: now)
+                lookalikeStore[key] = follower
+            }
         }
         reassessAll(now: now)
     }
@@ -441,6 +525,8 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         lastAlerted.removeAll()
         departed.removeAll()
         linker = EntityLinker()
+        lookalikes.reset()
+        lookalikeStore.removeAll()
         devicesUpdated.send()
         detectionsUpdated.send()
     }

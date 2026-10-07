@@ -58,13 +58,16 @@ struct StatusView: View {
                 }
 
                 Section {
-                    StatusCard(suspiciousCount: deviceService.suspiciousDevices.count,
+                    StatusCard(suspiciousCount: deviceService.suspiciousDevices.count + deviceService.activePossibleFollowers.count,
                                isScanning: deviceService.isScanning,
                                mode: deviceService.mode)
                 }
 
-                if !deviceService.suspiciousDevices.isEmpty {
+                if !deviceService.suspiciousDevices.isEmpty || !deviceService.activePossibleFollowers.isEmpty {
                     Section(header: Text("Needs attention")) {
+                        ForEach(deviceService.activePossibleFollowers) { follower in
+                            PossibleFollowerRow(follower: follower)
+                        }
                         ForEach(deviceService.suspiciousDevices) { device in
                             LiveDeviceRow(device: device, showReason: true)
                                 .contentShape(Rectangle())
@@ -220,6 +223,36 @@ struct LiveDeviceRow: View {
             }
             Spacer()
             Text("\(device.rssi) dBm")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - Possible Follower Row
+struct PossibleFollowerRow: View {
+    let follower: PossibleFollower
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(follower.displayName)
+                        .font(.headline)
+                    Text("Possible")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.yellow.opacity(0.25))
+                        .cornerRadius(4)
+                }
+                Text(follower.assessment.reason)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Text("\(follower.rssi) dBm")
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundColor(.secondary)
