@@ -10,51 +10,32 @@ import CoreData
 import Combine
 
 struct MainTabView: View {
-    @Environment(\.managedObjectContext) private var viewContext
-    @StateObject private var deviceService = DeviceService()
-
     var body: some View {
         TabView {
-            // Devices Tab
+            StatusView()
+                .tabItem {
+                    Label("Status", systemImage: "shield.lefthalf.filled")
+                }
+
             DevicesView()
                 .tabItem {
                     Label("Devices", systemImage: "antenna.radiowaves.left.and.right")
                 }
-                .environmentObject(deviceService)
 
-            // Calendar Tab
+            DeviceTrackerView()
+                .tabItem {
+                    Label("Locate", systemImage: "location.viewfinder")
+                }
+
             CalendarView()
                 .tabItem {
                     Label("Calendar", systemImage: "calendar")
                 }
-                .environmentObject(deviceService)
 
-            // Logs Tab
             LogsView()
                 .tabItem {
                     Label("Logs", systemImage: "doc.text")
                 }
-                .environmentObject(deviceService)
-
-            // Tracker Tab
-            DeviceTrackerView()
-                .tabItem {
-                    Label("Tracker", systemImage: "location.viewfinder")
-                }
-                .environmentObject(deviceService)
-
-            // Settings Tab
-            SettingsView()
-                .tabItem {
-                    Label("Settings", systemImage: "gear")
-                }
-                .environmentObject(deviceService)
-        }
-        .accentColor(.blue)
-        .onAppear {
-            // Auto-start scanning when app launches
-            print("App launched - starting device discovery")
-            deviceService.startDeviceDiscovery()
         }
     }
 }
@@ -62,54 +43,23 @@ struct MainTabView: View {
 // MARK: - Devices View
 struct DevicesView: View {
     @EnvironmentObject var deviceService: DeviceService
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(key: "lastSeen", ascending: false)])
+    private var devices: FetchedResults<BluetoothDevice>
     @State private var selectedDevice: BluetoothDevice?
-    @State private var showingDeviceDetail = false
+    @State private var showTrackersOnly = true
 
     var body: some View {
-        NavigationView {
-            VStack {
-                // Scanning status and controls
-                HStack {
-                    Circle()
-                        .fill(deviceService.isScanning ? Color.green : Color.gray)
-                        .frame(width: 8, height: 8)
-                    Text(deviceService.isScanning ? "Scanning for devices..." : "Scanning stopped")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    Spacer()
-
-                    // Scan Now button
-                    Button(action: {
-                        deviceService.scanNow()
-                    }) {
-                        HStack {
-                            Image(systemName: "antenna.radiowaves.left.and.right")
-                            Text("Scan Now")
-                        }
-                        .font(.subheadline)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.blue.opacity(0.1))
-                        .foregroundColor(.blue)
-                        .cornerRadius(8)
-                    }
-                }
-                .padding(.horizontal)
-
-                if deviceService.getAllDevices().isEmpty {
-                    // Empty state
+        NavigationStack {
+            Group {
+                if filteredDevices.isEmpty {
                     VStack(spacing: 20) {
                         Image(systemName: "antenna.radiowaves.left.and.right.slash")
                             .font(.system(size: 60))
                             .foregroundColor(.secondary)
-
-                        Text("No devices found yet")
+                        Text(showTrackersOnly ? "No trackers found yet" : "No devices found yet")
                             .font(.title2)
                             .foregroundColor(.secondary)
-
-                        Text("Devices will appear here as they are discovered")
-                            .font(.body)
+                        Text("Devices appear here as BlueClues hears them.")
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal)
@@ -117,25 +67,17 @@ struct DevicesView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List {
-                        Section(header: Text("All Devices")) {
-                            ForEach(deviceService.getAllDevices(), id: \.self) { device in
-                                DeviceRow(device: device, deviceService: deviceService)
-                                    .onTapGesture {
-                                        selectedDevice = device
-                                        showingDeviceDetail = true
-                                    }
+                        let favorites = filteredDevices.filter(\.isFavorite)
+                        if !favorites.isEmpty {
+                            Section(header: Text("Favorites")) {
+                                ForEach(favorites, id: \.objectID) { device in
+                                    deviceRow(device)
+                                }
                             }
                         }
-
-                        if !deviceService.getFavoriteDevices().isEmpty {
-                            Section(header: Text("Favorites")) {
-                                ForEach(deviceService.getFavoriteDevices(), id: \.self) { device in
-                                    DeviceRow(device: device, deviceService: deviceService)
-                                        .onTapGesture {
-                                            selectedDevice = device
-                                            showingDeviceDetail = true
-                                        }
-                                }
+                        Section(header: Text(showTrackersOnly ? "Trackers" : "All Devices")) {
+                            ForEach(filteredDevices, id: \.objectID) { device in
+                                deviceRow(device)
                             }
                         }
                     }
@@ -144,81 +86,79 @@ struct DevicesView: View {
             }
             .navigationTitle("Devices")
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showingDeviceDetail) {
-                if let device = selectedDevice {
-                    DeviceDetailView(device: device, deviceService: deviceService)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Picker("Show", selection: $showTrackersOnly) {
+                        Text("Trackers").tag(true)
+                        Text("All").tag(false)
+                    }
+                    .pickerStyle(.segmented)
                 }
             }
+            .sheet(item: $selectedDevice) { device in
+                DeviceDetailView(device: device, deviceService: deviceService)
+            }
         }
+    }
+
+    private var filteredDevices: [BluetoothDevice] {
+        showTrackersOnly ? devices.filter { $0.trackerKind != nil } : Array(devices)
+    }
+
+    private func deviceRow(_ device: BluetoothDevice) -> some View {
+        DeviceRow(device: device, live: device.uuid.flatMap { deviceService.liveDevice(id: $0) })
+            .contentShape(Rectangle())
+            .onTapGesture { selectedDevice = device }
     }
 }
 
 // MARK: - Device Row
 struct DeviceRow: View {
-    let device: BluetoothDevice
-    let deviceService: DeviceService
+    @ObservedObject var device: BluetoothDevice
+    let live: LiveDevice?
 
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(device.name ?? "Unknown Device")
+                    Text(device.name ?? device.trackerKind ?? "Unknown Device")
                         .font(.headline)
                     if device.isFavorite {
                         Image(systemName: "star.fill")
                             .foregroundColor(.yellow)
                             .font(.caption)
                     }
-                }
-
-                Text(device.uuid ?? "")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-
-                HStack(spacing: 12) {
-                    Text(device.deviceType ?? "Unknown")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    if let lastSeen = device.lastSeen {
-                        Text("Last seen: \(formatRelativeDate(lastSeen))")
-                            .font(.caption)
+                    if device.isIgnored {
+                        Image(systemName: "person.crop.circle.badge.checkmark")
                             .foregroundColor(.secondary)
-                    } else {
-                        Text("Last seen: Never")
                             .font(.caption)
-                            .foregroundColor(.secondary)
                     }
                 }
+                HStack(spacing: 12) {
+                    Text(device.deviceType ?? "Unknown")
+                    if let lastSeen = device.lastSeen {
+                        Text("Last seen \(lastSeen, style: .relative) ago")
+                    }
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
             }
 
             Spacer()
 
-            VStack(alignment: .trailing, spacing: 4) {
-                let stats = deviceService.getDeviceStatistics(forDevice: device)
-                Text("\(stats.totalDetections)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("detections")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+            if let live, live.isSuspicious {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.red)
             }
         }
         .padding(.vertical, 4)
-    }
-
-    private func formatRelativeDate(_ date: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
 // MARK: - Device Detail View
 struct DeviceDetailView: View {
-    let device: BluetoothDevice
-    let deviceService: DeviceService
+    @ObservedObject var device: BluetoothDevice
+    @ObservedObject var deviceService: DeviceService
     @Environment(\.presentationMode) var presentationMode
     @State private var showingEditNotes = false
     @State private var notes = ""
@@ -237,7 +177,7 @@ struct DeviceDetailView: View {
                             Spacer()
 
                             Button(action: {
-                                deviceService.updateDeviceFavoriteStatus(uuid: device.uuid!, isFavorite: !device.isFavorite)
+                                deviceService.updateDeviceFavoriteStatus(uuid: device.uuid ?? "", isFavorite: !device.isFavorite)
                             }) {
                                 Image(systemName: device.isFavorite ? "star.fill" : "star")
                                     .foregroundColor(device.isFavorite ? .yellow : .gray)
@@ -253,14 +193,32 @@ struct DeviceDetailView: View {
                     .background(Color.gray.opacity(0.1))
                     .cornerRadius(12)
 
+                    // Known / ignore
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("This is mine (never alert)", isOn: Binding(
+                            get: { device.isIgnored },
+                            set: { deviceService.setIgnored(uuid: device.uuid ?? "", ignored: $0) }
+                        ))
+                        Text("Use this for your own and your household's devices.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(12)
+
                     // Statistics
                     let stats = deviceService.getDeviceStatistics(forDevice: device)
                     VStack(alignment: .leading, spacing: 16) {
                         Text("Statistics")
                             .font(.headline)
 
+                        InfoRow(label: "Type", value: device.deviceType ?? "Unknown")
+                        if let live = deviceService.liveDevice(id: device.uuid ?? "") {
+                            InfoRow(label: "Assessment", value: live.assessment.reason)
+                        }
                         InfoRow(label: "Total Detections", value: "\(stats.totalDetections)")
-                        InfoRow(label: "Average RSSI", value: "\(stats.averageRSSI)dB")
+                        InfoRow(label: "Average RSSI", value: "\(stats.averageRSSI) dBm")
                         InfoRow(label: "Days Active", value: "\(stats.daysActive)")
                     }
                     .padding()
@@ -329,7 +287,7 @@ struct EditNotesView: View {
                     presentationMode.wrappedValue.dismiss()
                 },
                 trailing: Button("Save") {
-                    deviceService.updateDeviceNotes(uuid: device.uuid!, notes: notes)
+                    deviceService.updateDeviceNotes(uuid: device.uuid ?? "", notes: notes)
                     presentationMode.wrappedValue.dismiss()
                 }
             )
@@ -340,111 +298,50 @@ struct EditNotesView: View {
 // MARK: - Settings View
 struct SettingsView: View {
     @EnvironmentObject var deviceService: DeviceService
-    @State private var isScanning = true
-    @State private var scanIntervalValue: Double = 30
-    @State private var selectedUnit: ScanIntervalUnit = .seconds
-    @State private var bluetoothState: String = "Checking..."
+    @Environment(\.dismiss) private var dismiss
+    @State private var exportURL: URL?
+    @State private var confirmingClear = false
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
-                Section(header: Text("Scanning")) {
-                    Toggle("Enable Device Scanning", isOn: $isScanning)
-                        .onChange(of: isScanning) { newValue in
-                            if newValue {
-                                deviceService.startDeviceDiscovery()
-                            } else {
-                                deviceService.stopDeviceDiscovery()
-                            }
+                Section(header: Text("Detection"),
+                        footer: Text("Off: only known tracker types (Tile, SmartTag, Find My, Google, Chipolo) raise alerts. On: any Bluetooth device can, which also catches a person carrying a phone but is noisier.")) {
+                    Picker("Mode", selection: $deviceService.mode) {
+                        ForEach(ScanMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
-
-                    // Scan Interval Settings
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Scan Interval")
-                            .font(.headline)
-
-                        HStack {
-                            Text("Every")
-                                .foregroundColor(.secondary)
-
-                            TextField("Interval", value: $scanIntervalValue, format: .number)
-                                .keyboardType(.decimalPad)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 80)
-
-                            Picker("Unit", selection: $selectedUnit) {
-                                ForEach(ScanIntervalUnit.allCases) { unit in
-                                    Text(unit.rawValue).tag(unit)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .frame(width: 100)
-                        }
-
-                        Text("Current: \(Int(scanIntervalValue)) \(selectedUnit.shortName)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
                     }
-                    .onChange(of: scanIntervalValue) { _ in
-                        updateScanInterval()
-                    }
-                    .onChange(of: selectedUnit) { _ in
-                        updateScanInterval()
-                    }
-                    .onAppear {
-                        // Load current settings
-                        scanIntervalValue = deviceService.scanInterval
-                        selectedUnit = deviceService.scanIntervalUnit
-                        isScanning = deviceService.isScanning
-                        bluetoothState = deviceService.getBluetoothState()
-                    }
+                    Toggle("Alert on any device", isOn: $deviceService.alertOnAllDevices)
                 }
 
-                Section(header: Text("Bluetooth Status")) {
+                Section(header: Text("Status")) {
                     HStack {
-                        Text("Bluetooth State")
+                        Text("Bluetooth")
                         Spacer()
-                        Text(bluetoothState)
-                            .foregroundColor(bluetoothState == "Powered On" ? .green : .red)
+                        Text(deviceService.getBluetoothState())
+                            .foregroundColor(deviceService.bluetoothState == .poweredOn ? .green : .red)
                     }
-
                     HStack {
-                        Text("Scanning Status")
+                        Text("Scanning")
                         Spacer()
-                        Text(deviceService.isScanning ? "Active" : "Inactive")
+                        Text(deviceService.isScanning ? "Active" : "Stopped")
                             .foregroundColor(deviceService.isScanning ? .green : .secondary)
-                    }
-
-                    if bluetoothState != "Powered On" {
-                        Text("⚠️ Enable Bluetooth in Settings to scan for devices")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
-
-                    if bluetoothState == "Unauthorized" {
-                        Text("⚠️ Grant Bluetooth permission in Settings > Privacy & Security > Bluetooth")
-                            .font(.caption)
-                            .foregroundColor(.orange)
                     }
                 }
 
                 Section(header: Text("Data")) {
-                    Button("Clear All Data") {
-                        // Implement data clearing
-                        print("Clear all data functionality would be implemented here")
+                    if let exportURL {
+                        ShareLink(item: exportURL) {
+                            Label("Share Detections CSV", systemImage: "square.and.arrow.up")
+                        }
+                    } else {
+                        Button("Export Detections") {
+                            exportURL = deviceService.exportCSV()
+                        }
                     }
-                    .foregroundColor(.red)
-                }
-
-                Section(header: Text("Debug")) {
-                    Button("Test Bluetooth Scan") {
-                        print("🔍 Testing Bluetooth scan...")
-                        deviceService.scanNow()
-                    }
-
-                    Button("Refresh Bluetooth Status") {
-                        bluetoothState = deviceService.getBluetoothState()
-                        print("🔄 Bluetooth state: \(bluetoothState)")
+                    Button("Clear All Data", role: .destructive) {
+                        confirmingClear = true
                     }
                 }
 
@@ -452,25 +349,24 @@ struct SettingsView: View {
                     HStack {
                         Text("Version")
                         Spacer()
-                        Text("1.0.0")
-                            .foregroundColor(.secondary)
-                    }
-
-                    HStack {
-                        Text("Devices Found")
-                        Spacer()
-                        Text("\(deviceService.getAllDevices().count)")
+                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
                             .foregroundColor(.secondary)
                     }
                 }
             }
             .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .confirmationDialog("Delete every saved device, detection and log?",
+                                isPresented: $confirmingClear, titleVisibility: .visible) {
+                Button("Delete All", role: .destructive) {
+                    deviceService.clearAllData()
+                    exportURL = nil
+                }
+            }
         }
     }
-
-    private func updateScanInterval() {
-        deviceService.updateScanInterval(scanIntervalValue, unit: selectedUnit)
-    }
 }
-
-

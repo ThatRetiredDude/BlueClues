@@ -10,7 +10,7 @@ import CoreData
 
 struct LogsView: View {
     @Environment(\.managedObjectContext) private var viewContext
-    @StateObject private var deviceService = DeviceService()
+    @EnvironmentObject private var deviceService: DeviceService
     @State private var selectedDevice: BluetoothDevice?
     @State private var selectedEventType: String?
     @State private var searchText = ""
@@ -107,9 +107,6 @@ struct LogsView: View {
             }
             .navigationTitle("Device Logs")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarItems(trailing: Button("Export") {
-                exportLogs()
-            })
         }
         .onAppear {
             loadLogs()
@@ -210,11 +207,6 @@ struct LogsView: View {
         }
     }
 
-    private func exportLogs() {
-        // In a real app, you'd implement CSV or JSON export
-        print("Export functionality would be implemented here")
-    }
-
     private var calendar: Calendar {
         Calendar.current
     }
@@ -228,7 +220,7 @@ struct FiltersView: View {
     @Binding var endDate: Date
     @ObservedObject var deviceService: DeviceService
 
-    private let eventTypes = ["discovered", "arrived", "departed", "signal_change"]
+    private let eventTypes = ["discovered", "arrived", "departed", "suspicious"]
 
     var body: some View {
         VStack(spacing: 16) {
@@ -387,7 +379,7 @@ struct LogRowView: View {
             return .green
         case "departed":
             return .red
-        case "signal_change":
+        case "suspicious":
             return .orange
         default:
             return .gray
@@ -509,5 +501,6 @@ struct LogsView_Previews: PreviewProvider {
     static var previews: some View {
         LogsView()
             .environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
+            .environmentObject(DeviceService(persistenceController: .preview, autoStart: false))
     }
 }

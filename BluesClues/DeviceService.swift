@@ -4,592 +4,526 @@
 //
 //  Created by Jared Maxwell on 8/31/25.
 //
+//  The single app-wide service: turns advertisements from ScanEngine into
+//  entities, keeps live state for the UI, scores each entity for following or
+//  lingering, raises alerts, and records throttled history in Core Data.
+//  Everything here runs on the main queue.
+//
 
 import Foundation
 import CoreData
 import CoreLocation
-import Combine
 import CoreBluetooth
+import Combine
+import UserNotifications
 
-// MARK: - Scan Interval Unit
-enum ScanIntervalUnit: String, CaseIterable, Identifiable {
-    case seconds = "Seconds"
-    case minutes = "Minutes"
-    case hours = "Hours"
+// MARK: - Live Device
+struct LiveDevice: Identifiable, Equatable {
+    let id: String
+    var name: String?
+    var tracker: TrackerMatch?
+    var rssi: Int
+    var firstSeen: Date
+    var lastSeen: Date
+    var assessment: FollowAssessment
+    var isIgnored: Bool
 
-    var id: String { self.rawValue }
-
-    var multiplier: TimeInterval {
-        switch self {
-        case .seconds: return 1
-        case .minutes: return 60
-        case .hours: return 3600
-        }
+    var displayName: String {
+        if let name, !name.isEmpty { return name }
+        return tracker?.kind.rawValue ?? "Unknown device"
     }
 
-    var shortName: String {
-        switch self {
-        case .seconds: return "sec"
-        case .minutes: return "min"
-        case .hours: return "hrs"
-        }
-    }
+    var isSuspicious: Bool { assessment.isSuspicious && !isIgnored }
 }
 
 // MARK: - Device Service
-class DeviceService: BluetoothManagerDelegate, ObservableObject {
-    // MARK: - Properties
-    private let persistenceController: PersistenceController
-    private let bluetoothManager: BluetoothManager
-    private var cancellables = Set<AnyCancellable>()
+final class DeviceService: ScanEngineDelegate, ObservableObject {
+    // MARK: Published state
+    @Published private(set) var isScanning = false
+    /// Snapshot of `liveStore`, published at most twice a second so busy
+    /// places don't redraw the UI on every advertisement.
+    @Published private(set) var liveDevices: [String: LiveDevice] = [:]
+    @Published private(set) var bluetoothState: CBManagerState = .unknown
+    @Published private(set) var locationAuthorization: CLAuthorizationStatus = .notDetermined
+    @Published var mode: ScanMode {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: Keys.mode)
+            engine.setMode(mode)
+            reassessAll()
+        }
+    }
+    @Published var alertOnAllDevices: Bool {
+        didSet { UserDefaults.standard.set(alertOnAllDevices, forKey: Keys.alertOnAllDevices) }
+    }
 
-    // Scan interval settings
-    @Published var scanInterval: TimeInterval = 30 // Default 30 seconds
-    @Published var scanIntervalUnit: ScanIntervalUnit = .seconds
-    @Published var isScanning = false
-    private var scanTimer: Timer?
-
-    // UserDefaults keys for persistence
-    private let scanIntervalKey = "scanInterval"
-    private let scanIntervalUnitKey = "scanIntervalUnit"
-
-    // Publishers for UI updates
     let devicesUpdated = PassthroughSubject<Void, Never>()
     let detectionsUpdated = PassthroughSubject<Void, Never>()
 
-    // In-memory cache for quick access
-    private var deviceCache: [String: BluetoothDevice] = [:]
-    private var lastDetectionTimes: [String: Date] = [:]
+    // MARK: Private state
+    private enum Keys {
+        static let mode = "scanMode"
+        static let scanningEnabled = "scanningEnabled"
+        static let alertOnAllDevices = "alertOnAllDevices"
+    }
 
-    // Pattern of life tracking
-    private let presenceThreshold: TimeInterval = 300 // 5 minutes
-    private let departureThreshold: TimeInterval = 600 // 10 minutes
+    private let persistenceController: PersistenceController
+    private let engine: ScanEngine
+    private var linker = EntityLinker()
+    private var liveStore: [String: LiveDevice] = [:] {
+        didSet { scheduleLiveFlush() }
+    }
+    private var liveFlushScheduled = false
+    private var sightings: [String: [Sighting]] = [:]
+    private var lastPersisted: [String: Date] = [:]
+    private var lastAlerted: [String: Date] = [:]
+    private var departed: Set<String> = []
+    private var housekeepingTimer: Timer?
+    private var config = DetectorConfig()
 
-    // MARK: - Initialization
-    init(persistenceController: PersistenceController = .shared) {
+    /// One stored detection per entity per this interval.
+    private let persistInterval: TimeInterval = 15
+    /// Gap after which a device counts as having left.
+    private let departureThreshold: TimeInterval = 10 * 60
+    /// Don't re-alert on the same device within this window.
+    private let realertInterval: TimeInterval = 30 * 60
+    /// Drop live entries not seen for this long.
+    private let liveRetention: TimeInterval = 6 * 60 * 60
+    /// Stored detections older than this are deleted.
+    private let historyRetentionDays = 60
+
+    private var viewContext: NSManagedObjectContext { persistenceController.container.viewContext }
+
+    // MARK: Init
+    init(persistenceController: PersistenceController = .shared, autoStart: Bool = true) {
         self.persistenceController = persistenceController
-        self.bluetoothManager = BluetoothManager()
-        self.bluetoothManager.delegate = self
-
-        loadDeviceCache()
-        loadScanSettings()
-    }
-
-    private func loadScanSettings() {
+        self.engine = ScanEngine()
         let defaults = UserDefaults.standard
-        scanInterval = defaults.double(forKey: scanIntervalKey)
-        if scanInterval <= 0 {
-            scanInterval = 30 // Default to 30 seconds
-        }
+        self.mode = ScanMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .inMotion
+        self.alertOnAllDevices = defaults.bool(forKey: Keys.alertOnAllDevices)
+        self.engine.delegate = self
+        self.locationAuthorization = engine.locationAuthorization
 
-        if let unitString = defaults.string(forKey: scanIntervalUnitKey),
-           let unit = ScanIntervalUnit(rawValue: unitString) {
-            scanIntervalUnit = unit
+        let enabled = defaults.object(forKey: Keys.scanningEnabled) as? Bool ?? true
+        if autoStart && enabled {
+            startDeviceDiscovery()
         }
+        pruneHistory()
     }
 
-    private func saveScanSettings() {
-        let defaults = UserDefaults.standard
-        defaults.set(scanInterval, forKey: scanIntervalKey)
-        defaults.set(scanIntervalUnit.rawValue, forKey: scanIntervalUnitKey)
-        defaults.synchronize()
-    }
-
-    // MARK: - Public Methods
-
-    // MARK: - Device Management
+    // MARK: Scanning control
     func startDeviceDiscovery() {
-        guard !isScanning else {
-            print("DeviceService: Already scanning")
-            return
-        }
-
-        print("DeviceService: Starting device discovery")
+        guard !isScanning else { return }
         isScanning = true
-        bluetoothManager.startScanning()
-        startScanTimer()
+        UserDefaults.standard.set(true, forKey: Keys.scanningEnabled)
+        requestNotificationPermission()
+        engine.start(mode: mode)
+        housekeepingTimer?.invalidate()
+        housekeepingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.housekeeping()
+        }
     }
 
     func stopDeviceDiscovery() {
-        guard isScanning else {
-            print("DeviceService: Not scanning")
-            return
-        }
-
-        print("DeviceService: Stopping device discovery")
+        guard isScanning else { return }
         isScanning = false
-        bluetoothManager.stopScanning()
-        stopScanTimer()
+        UserDefaults.standard.set(false, forKey: Keys.scanningEnabled)
+        engine.stop()
+        housekeepingTimer?.invalidate()
+        housekeepingTimer = nil
     }
 
     func scanNow() {
-        print("DeviceService: Performing immediate scan")
-
-        // Perform an immediate scan
-        bluetoothManager.startScanning()
-
-        // Stop scanning after a brief period (e.g., 10 seconds) if not in continuous mode
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-            if !self.isScanning { // Only stop if not in continuous scanning mode
-                print("DeviceService: Stopping manual scan after 10 seconds")
-                self.bluetoothManager.stopScanning()
-            }
-        }
+        startDeviceDiscovery()
     }
 
     func getBluetoothState() -> String {
-        let state = bluetoothManager.bluetoothState
-        switch state {
+        switch bluetoothState {
         case .poweredOn: return "Powered On"
         case .poweredOff: return "Powered Off"
         case .unauthorized: return "Unauthorized"
         case .unsupported: return "Unsupported"
         case .resetting: return "Resetting"
         case .unknown: return "Unknown"
-        @unknown default: return "Unknown (\(state.rawValue))"
+        @unknown default: return "Unknown"
         }
     }
 
-    func updateScanInterval(_ interval: TimeInterval, unit: ScanIntervalUnit) {
-        scanInterval = interval
-        scanIntervalUnit = unit
-        saveScanSettings()
-
-        // Restart scanning with new interval if currently scanning
-        if isScanning {
-            stopScanTimer()
-            startScanTimer()
-        }
+    // MARK: Live views
+    var suspiciousDevices: [LiveDevice] {
+        liveDevices.values
+            .filter { $0.isSuspicious && (alertOnAllDevices || $0.tracker != nil) }
+            .sorted { $0.assessment.score > $1.assessment.score }
     }
 
-    private func startScanTimer() {
-        stopScanTimer() // Ensure no existing timer
-
-        let interval = scanInterval * scanIntervalUnit.multiplier
-        scanTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.performPeriodicScan()
-        }
+    var nearbyTrackers: [LiveDevice] {
+        liveDevices.values
+            .filter { $0.tracker != nil && Date().timeIntervalSince($0.lastSeen) < 120 }
+            .sorted { $0.rssi > $1.rssi }
     }
 
-    private func stopScanTimer() {
-        scanTimer?.invalidate()
-        scanTimer = nil
+    var nearbyOtherCount: Int {
+        liveDevices.values.filter { $0.tracker == nil && Date().timeIntervalSince($0.lastSeen) < 120 }.count
     }
 
-    private func performPeriodicScan() {
-        bluetoothManager.startScanning()
-    }
+    func liveDevice(id: String) -> LiveDevice? { liveStore[id] }
 
-    func getAllDevices() -> [BluetoothDevice] {
-        let context = persistenceController.container.viewContext
-        let fetchRequest: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "lastSeen", ascending: false)]
+    // MARK: ScanEngineDelegate
+    func scanEngine(_ engine: ScanEngine, didReceive advertisement: Advertisement) {
+        let id = linker.entityID(forPeripheral: advertisement.peripheralID,
+                                 kind: advertisement.tracker?.kind,
+                                 rssi: advertisement.rssi,
+                                 at: advertisement.time)
+        let previousSeen = liveStore[id]?.lastSeen
 
-        do {
-            return try context.fetch(fetchRequest)
-        } catch {
-            print("Error fetching devices: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    func getFavoriteDevices() -> [BluetoothDevice] {
-        let context = persistenceController.container.viewContext
-        let fetchRequest: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "isFavorite == YES")
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "lastSeen", ascending: false)]
-
-        do {
-            return try context.fetch(fetchRequest)
-        } catch {
-            print("Error fetching favorite devices: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    func getDevice(byUUID uuid: String) -> BluetoothDevice? {
-        // Check cache first
-        if let cachedDevice = deviceCache[uuid] {
-            return cachedDevice
-        }
-
-        let context = persistenceController.container.viewContext
-        let fetchRequest: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "uuid == %@", uuid)
-        fetchRequest.fetchLimit = 1
-
-        do {
-            let devices = try context.fetch(fetchRequest)
-            if let device = devices.first {
-                deviceCache[uuid] = device
-                return device
-            }
-        } catch {
-            print("Error fetching device by UUID: \(error.localizedDescription)")
-        }
-
-        return nil
-    }
-
-    func updateDeviceFavoriteStatus(uuid: String, isFavorite: Bool) {
-        let context = persistenceController.container.viewContext
-
-        context.perform {
-            if let device = self.getDevice(byUUID: uuid) {
-                device.isFavorite = isFavorite
-                do {
-                    try context.save()
-                    self.devicesUpdated.send()
-                } catch {
-                    print("Error updating device favorite status: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    func updateDeviceNotes(uuid: String, notes: String) {
-        let context = persistenceController.container.viewContext
-
-        context.perform {
-            if let device = self.getDevice(byUUID: uuid) {
-                device.customNotes = notes
-                do {
-                    try context.save()
-                    self.devicesUpdated.send()
-                } catch {
-                    print("Error updating device notes: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
-
-    // MARK: - Detection History
-    func getDetectionHistory(forDevice device: BluetoothDevice, limit: Int = 100) -> [DeviceDetection] {
-        let context = persistenceController.container.viewContext
-        let fetchRequest: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "device == %@", device)
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
-        fetchRequest.fetchLimit = limit
-
-        do {
-            return try context.fetch(fetchRequest)
-        } catch {
-            print("Error fetching detection history: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    func getDeviceLogs(forDevice device: BluetoothDevice, limit: Int = 50) -> [DeviceLog] {
-        let context = persistenceController.container.viewContext
-        let fetchRequest: NSFetchRequest<DeviceLog> = DeviceLog.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "device == %@", device)
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
-        fetchRequest.fetchLimit = limit
-
-        do {
-            return try context.fetch(fetchRequest)
-        } catch {
-            print("Error fetching device logs: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    // MARK: - Pattern of Life Analysis
-    func getDevicePresencePattern(forDevice device: BluetoothDevice, days: Int = 7) -> [Date: Bool] {
-        let context = persistenceController.container.viewContext
-        let endDate = Date()
-        let startDate = Calendar.current.date(byAdding: .day, value: -days, to: endDate)!
-
-        let fetchRequest: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "device == %@ AND timestamp >= %@ AND timestamp <= %@", device, startDate as NSDate, endDate as NSDate)
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
-
-        do {
-            let detections = try context.fetch(fetchRequest)
-            return analyzePresencePattern(from: detections, startDate: startDate, endDate: endDate)
-        } catch {
-            print("Error fetching presence pattern: \(error.localizedDescription)")
-            return [:]
-        }
-    }
-
-    func getDeviceArrivalDepartureTimes(forDevice device: BluetoothDevice, date: Date) -> [(type: String, time: Date)] {
-        let context = persistenceController.container.viewContext
-        let startOfDay = Calendar.current.startOfDay(for: date)
-        let endOfDay = Calendar.current.date(byAdding: .day, value: 1, to: startOfDay)!
-
-        let fetchRequest: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
-        fetchRequest.predicate = NSPredicate(format: "device == %@ AND timestamp >= %@ AND timestamp <= %@", device, startOfDay as NSDate, endOfDay as NSDate)
-        fetchRequest.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
-
-        do {
-            let detections = try context.fetch(fetchRequest)
-            return analyzeArrivalDepartureTimes(from: detections)
-        } catch {
-            print("Error fetching arrival/departure times: \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    // MARK: - Statistics
-    func getDeviceStatistics(forDevice device: BluetoothDevice) -> DeviceStatistics {
-        let context = persistenceController.container.viewContext
-
-        // Total detections
-        let detectionCount = getDetectionHistory(forDevice: device, limit: 1000).count
-
-        // Average RSSI
-        let detections = getDetectionHistory(forDevice: device, limit: 100)
-        let averageRSSI = detections.isEmpty ? 0 : detections.reduce(0) { $0 + Int($1.rssi) } / detections.count
-
-        // Last seen
-        let lastSeen = device.lastSeen
-
-        // Days since first seen
-        let daysActive = device.firstSeen.map { Calendar.current.dateComponents([.day], from: $0, to: Date()).day ?? 0 } ?? 0
-
-        return DeviceStatistics(
-            totalDetections: detectionCount,
-            averageRSSI: averageRSSI,
-            lastSeen: lastSeen ?? Date.distantPast,
-            daysActive: daysActive
+        var entry = liveStore[id] ?? LiveDevice(
+            id: id,
+            name: advertisement.name,
+            tracker: advertisement.tracker,
+            rssi: advertisement.rssi,
+            firstSeen: advertisement.time,
+            lastSeen: advertisement.time,
+            assessment: FollowAssessment(isSuspicious: false, score: 0, reason: "Just seen"),
+            isIgnored: getDevice(byUUID: id)?.isIgnored ?? false
         )
-    }
+        entry.rssi = advertisement.rssi
+        entry.lastSeen = advertisement.time
+        if entry.name == nil { entry.name = advertisement.name }
+        if let tracker = advertisement.tracker { entry.tracker = tracker }
 
-    // MARK: - Private Methods
-    private func loadDeviceCache() {
-        let devices = getAllDevices()
-        for device in devices {
-            deviceCache[device.uuid!] = device
-            lastDetectionTimes[device.uuid!] = device.lastSeen
+        // Throttle: keep one sighting and one stored detection per interval.
+        let lastStored = lastPersisted[id]
+        if lastStored == nil || advertisement.time.timeIntervalSince(lastStored!) >= persistInterval {
+            lastPersisted[id] = advertisement.time
+            sightings[id, default: []].append(Sighting(time: advertisement.time,
+                                                       latitude: advertisement.latitude,
+                                                       longitude: advertisement.longitude,
+                                                       rssi: advertisement.rssi))
+            entry.assessment = FollowDetector.assess(sightings[id] ?? [], mode: mode, config: config, now: advertisement.time)
+            persist(advertisement, entityID: id, entry: entry, previousSeen: previousSeen)
+        }
+
+        liveStore[id] = entry
+        if entry.isSuspicious && (alertOnAllDevices || entry.tracker != nil) {
+            raiseAlertIfNeeded(for: entry)
         }
     }
 
-    private func processDeviceDiscovery(_ deviceInfo: BluetoothDeviceInfo) {
-        let context = persistenceController.container.newBackgroundContext()
-
-        context.perform {
-            // Check if device already exists
-            let existingDevice = self.getDevice(byUUID: deviceInfo.uuid)
-
-            if let device = existingDevice {
-                // Update existing device
-                self.updateExistingDevice(device, with: deviceInfo, in: context)
-            } else {
-                // Create new device
-                self.createNewDevice(from: deviceInfo, in: context)
-            }
-
-            // Create detection record
-            self.createDetectionRecord(for: deviceInfo, in: context)
-
-            // Check for pattern of life events
-            self.checkForPresenceEvents(deviceInfo)
-
-            do {
-                try context.save()
-                DispatchQueue.main.async {
-                    self.devicesUpdated.send()
-                    self.detectionsUpdated.send()
-                }
-            } catch {
-                print("Error saving device data: \(error.localizedDescription)")
-            }
-        }
+    func scanEngine(_ engine: ScanEngine, didUpdateBluetoothState state: CBManagerState) {
+        bluetoothState = state
     }
 
-    private func createNewDevice(from deviceInfo: BluetoothDeviceInfo, in context: NSManagedObjectContext) {
-        let device = BluetoothDevice(context: context)
-        device.uuid = deviceInfo.uuid
-        device.name = deviceInfo.name
-        device.deviceType = self.inferDeviceType(from: deviceInfo)
-        device.firstSeen = deviceInfo.timestamp
-        device.lastSeen = deviceInfo.timestamp
-        device.isFavorite = false
-
-        // Add to cache
-        deviceCache[deviceInfo.uuid] = device
-        lastDetectionTimes[deviceInfo.uuid] = deviceInfo.timestamp
-
-        // Log device discovery
-        createLogEntry(for: device, eventType: "discovered", rssi: deviceInfo.rssi, metadata: deviceInfo.advertisementData.description, in: context)
+    func scanEngine(_ engine: ScanEngine, didUpdateLocationAuthorization status: CLAuthorizationStatus) {
+        locationAuthorization = status
     }
 
-    private func updateExistingDevice(_ device: BluetoothDevice, with deviceInfo: BluetoothDeviceInfo, in context: NSManagedObjectContext) {
-        device.lastSeen = deviceInfo.timestamp
-
-        // Update name if it changed and wasn't manually set
-        if device.name == nil || device.name!.isEmpty {
-            device.name = deviceInfo.name
+    // MARK: Persistence
+    private func persist(_ advertisement: Advertisement, entityID: String, entry: LiveDevice, previousSeen: Date?) {
+        let device: BluetoothDevice
+        var isNew = false
+        if let existing = getDevice(byUUID: entityID) {
+            device = existing
+        } else {
+            device = BluetoothDevice(context: viewContext)
+            device.uuid = entityID
+            device.firstSeen = advertisement.time
+            device.isFavorite = false
+            isNew = true
         }
 
-        // Update cache
-        lastDetectionTimes[deviceInfo.uuid] = deviceInfo.timestamp
-    }
+        // An arrival is a sighting after a long silence; check before updating lastSeen.
+        let lastKnown = previousSeen ?? device.lastSeen
+        if !isNew, let lastKnown, advertisement.time.timeIntervalSince(lastKnown) > departureThreshold {
+            createLogEntry(for: device, eventType: "arrived", rssi: advertisement.rssi,
+                           metadata: "Away for \(Int(advertisement.time.timeIntervalSince(lastKnown) / 60)) min")
+        }
+        departed.remove(entityID)
 
-    private func createDetectionRecord(for deviceInfo: BluetoothDeviceInfo, in context: NSManagedObjectContext) {
-        guard let device = getDevice(byUUID: deviceInfo.uuid) else { return }
+        device.lastSeen = advertisement.time
+        if (device.name ?? "").isEmpty, let name = advertisement.name { device.name = name }
+        device.deviceType = entry.tracker?.kind.rawValue ?? device.deviceType ?? "Other"
+        if let kind = entry.tracker?.kind { device.trackerKind = kind.rawValue }
 
-        let detection = DeviceDetection(context: context)
-        detection.timestamp = deviceInfo.timestamp
-        detection.rssi = Int16(deviceInfo.rssi)
-        detection.isConnected = false // We don't track connections in this simple version
+        if isNew {
+            createLogEntry(for: device, eventType: "discovered", rssi: advertisement.rssi, metadata: advertisement.summary)
+        }
+
+        let detection = DeviceDetection(context: viewContext)
+        detection.timestamp = advertisement.time
+        detection.rssi = Int16(clamping: advertisement.rssi)
+        detection.isConnected = false
+        if let lat = advertisement.latitude, let lon = advertisement.longitude {
+            detection.latitude = lat
+            detection.longitude = lon
+        }
         detection.device = device
 
-        // Add location if available
-        // Note: In a real app, you'd get location from CLLocationManager
-        // detection.latitude = location.latitude
-        // detection.longitude = location.longitude
+        save()
     }
 
-    private func createLogEntry(for device: BluetoothDevice, eventType: String, rssi: Int, metadata: String? = nil, in context: NSManagedObjectContext) {
-        let log = DeviceLog(context: context)
+    private func createLogEntry(for device: BluetoothDevice, eventType: String, rssi: Int, metadata: String? = nil) {
+        let log = DeviceLog(context: viewContext)
         log.timestamp = Date()
         log.eventType = eventType
-        log.rssi = Int16(rssi)
+        log.rssi = Int16(clamping: rssi)
         log.metadata = metadata
         log.device = device
     }
 
-    private func checkForPresenceEvents(_ deviceInfo: BluetoothDeviceInfo) {
-        let uuid = deviceInfo.uuid
-
-        if let lastDetectionTime = lastDetectionTimes[uuid] {
-            let timeSinceLastDetection = deviceInfo.timestamp.timeIntervalSince(lastDetectionTime)
-
-            // Check for arrival (device was gone for more than departure threshold)
-            if timeSinceLastDetection > departureThreshold {
-                print("Device \(deviceInfo.name ?? "Unknown") arrived")
-                if let device = getDevice(byUUID: uuid) {
-                    let context = persistenceController.container.newBackgroundContext()
-                    context.perform {
-                        self.createLogEntry(for: device, eventType: "arrived", rssi: deviceInfo.rssi, metadata: "Time since last detection: \(timeSinceLastDetection)s", in: context)
-                        try? context.save()
-                    }
-                }
-            }
+    private func save() {
+        guard viewContext.hasChanges else { return }
+        do {
+            try viewContext.save()
+            devicesUpdated.send()
+            detectionsUpdated.send()
+        } catch {
+            print("DeviceService: save failed: \(error.localizedDescription)")
+            viewContext.rollback()
         }
     }
 
-    private func inferDeviceType(from deviceInfo: BluetoothDeviceInfo) -> String {
-        let name = deviceInfo.name?.lowercased() ?? ""
-        let advertisementData = deviceInfo.advertisementData
+    // MARK: Alerts
+    private func raiseAlertIfNeeded(for device: LiveDevice) {
+        let now = Date()
+        if let last = lastAlerted[device.id], now.timeIntervalSince(last) < realertInterval { return }
+        lastAlerted[device.id] = now
 
-        // Check for common device types based on name and advertisement data
-        if name.contains("airpods") || name.contains("earbuds") {
-            return "Headphones"
-        } else if name.contains("watch") || name.contains("iwatch") {
-            return "Smart Watch"
-        } else if name.contains("phone") || name.contains("iphone") || name.contains("android") {
-            return "Phone"
-        } else if name.contains("mac") || name.contains("laptop") || name.contains("computer") {
-            return "Computer"
-        } else if name.contains("speaker") || name.contains("sound") {
-            return "Speaker"
-        } else if name.contains("keyboard") {
-            return "Keyboard"
-        } else if name.contains("mouse") {
-            return "Mouse"
-        } else if name.contains("trackpad") {
-            return "Trackpad"
-        } else if let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] {
-            // Check service UUIDs for device type hints
-            for uuid in serviceUUIDs {
-                if uuid.uuidString.contains("180F") { return "Battery Device" }
-                if uuid.uuidString.contains("1805") { return "Time Device" }
-                if uuid.uuidString.contains("180A") { return "Device Information" }
-            }
+        if let stored = getDevice(byUUID: device.id) {
+            createLogEntry(for: stored, eventType: "suspicious", rssi: device.rssi, metadata: device.assessment.reason)
+            save()
         }
 
-        return "Unknown"
+        let content = UNMutableNotificationContent()
+        content.title = mode == .inMotion ? "Possible tracker following you" : "Unfamiliar device staying nearby"
+        content.body = "\(device.displayName): \(device.assessment.reason)."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "suspicious-\(device.id)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
-    private func analyzePresencePattern(from detections: [DeviceDetection], startDate: Date, endDate: Date) -> [Date: Bool] {
-        var pattern: [Date: Bool] = [:]
-        let calendar = Calendar.current
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
 
-        // Group detections by day
-        var detectionsByDay: [Date: [DeviceDetection]] = [:]
+    private func scheduleLiveFlush() {
+        guard !liveFlushScheduled else { return }
+        liveFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.liveFlushScheduled = false
+            self.liveDevices = self.liveStore
+        }
+    }
+
+    // MARK: Housekeeping
+    private func housekeeping() {
+        let now = Date()
+        for (id, device) in liveStore where !departed.contains(id) && now.timeIntervalSince(device.lastSeen) > departureThreshold {
+            departed.insert(id)
+            if let stored = getDevice(byUUID: id) {
+                createLogEntry(for: stored, eventType: "departed", rssi: device.rssi,
+                               metadata: "Last seen \(Int(now.timeIntervalSince(device.lastSeen) / 60)) min ago")
+            }
+        }
+        save()
+
+        linker.prune(olderThan: liveRetention, now: now)
+        for (id, device) in liveStore where now.timeIntervalSince(device.lastSeen) > liveRetention {
+            liveStore[id] = nil
+            sightings[id] = nil
+            lastPersisted[id] = nil
+        }
+        for id in sightings.keys {
+            sightings[id]?.removeAll { now.timeIntervalSince($0.time) > config.lookback }
+        }
+        reassessAll(now: now)
+    }
+
+    private func reassessAll(now: Date = Date()) {
+        for (id, var device) in liveStore {
+            device.assessment = FollowDetector.assess(sightings[id] ?? [], mode: mode, config: config, now: now)
+            liveStore[id] = device
+        }
+    }
+
+    private func pruneHistory() {
+        guard let cutoff = Calendar.current.date(byAdding: .day, value: -historyRetentionDays, to: Date()) else { return }
+        let request: NSFetchRequest<NSFetchRequestResult> = DeviceDetection.fetchRequest()
+        request.predicate = NSPredicate(format: "timestamp < %@", cutoff as NSDate)
+        let delete = NSBatchDeleteRequest(fetchRequest: request)
+        _ = try? viewContext.execute(delete)
+        viewContext.reset()
+    }
+
+    // MARK: Device management
+    func getAllDevices() -> [BluetoothDevice] {
+        let request: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
+        request.sortDescriptors = [NSSortDescriptor(key: "lastSeen", ascending: false)]
+        return (try? viewContext.fetch(request)) ?? []
+    }
+
+    func getFavoriteDevices() -> [BluetoothDevice] {
+        let request: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
+        request.predicate = NSPredicate(format: "isFavorite == YES")
+        request.sortDescriptors = [NSSortDescriptor(key: "lastSeen", ascending: false)]
+        return (try? viewContext.fetch(request)) ?? []
+    }
+
+    func getDevice(byUUID uuid: String) -> BluetoothDevice? {
+        let request: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
+        request.predicate = NSPredicate(format: "uuid == %@", uuid)
+        request.fetchLimit = 1
+        return (try? viewContext.fetch(request))?.first
+    }
+
+    func updateDeviceFavoriteStatus(uuid: String, isFavorite: Bool) {
+        guard let device = getDevice(byUUID: uuid) else { return }
+        device.isFavorite = isFavorite
+        save()
+    }
+
+    func updateDeviceNotes(uuid: String, notes: String) {
+        guard let device = getDevice(byUUID: uuid) else { return }
+        device.customNotes = notes
+        save()
+    }
+
+    /// Marks a device as yours (or otherwise known), so it never raises alerts.
+    func setIgnored(uuid: String, ignored: Bool) {
+        if let device = getDevice(byUUID: uuid) {
+            device.isIgnored = ignored
+            save()
+        }
+        liveStore[uuid]?.isIgnored = ignored
+    }
+
+    func clearAllData() {
+        for entity in ["DeviceDetection", "DeviceLog", "BluetoothDevice"] {
+            let request = NSFetchRequest<NSFetchRequestResult>(entityName: entity)
+            _ = try? viewContext.execute(NSBatchDeleteRequest(fetchRequest: request))
+        }
+        viewContext.reset()
+        liveStore.removeAll()
+        sightings.removeAll()
+        lastPersisted.removeAll()
+        lastAlerted.removeAll()
+        departed.removeAll()
+        linker = EntityLinker()
+        devicesUpdated.send()
+        detectionsUpdated.send()
+    }
+
+    /// Writes all stored detections to a CSV file and returns its URL.
+    func exportCSV() -> URL? {
+        let request: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
+        guard let detections = try? viewContext.fetch(request) else { return nil }
+
+        let iso = ISO8601DateFormatter()
+        var csv = "timestamp,device_id,name,type,rssi,latitude,longitude\n"
         for detection in detections {
-            if let timestamp = detection.timestamp {
-                let day = calendar.startOfDay(for: timestamp)
-                detectionsByDay[day, default: []].append(detection)
-            }
+            let device = detection.device
+            let name = (device?.name ?? "").replacingOccurrences(of: "\"", with: "\"\"")
+            let hasFix = detection.latitude != 0 || detection.longitude != 0
+            csv += [
+                detection.timestamp.map { iso.string(from: $0) } ?? "",
+                device?.uuid ?? "",
+                "\"\(name)\"",
+                device?.deviceType ?? "",
+                "\(detection.rssi)",
+                hasFix ? "\(detection.latitude)" : "",
+                hasFix ? "\(detection.longitude)" : ""
+            ].joined(separator: ",") + "\n"
         }
 
-        // Fill in the pattern for each day
-        var currentDate = startDate
-        while currentDate <= endDate {
-            let day = calendar.startOfDay(for: currentDate)
-            let dayDetections = detectionsByDay[day] ?? []
-            pattern[day] = !dayDetections.isEmpty
-            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("BlueClues-detections.csv")
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            print("DeviceService: export failed: \(error.localizedDescription)")
+            return nil
         }
+    }
 
+    // MARK: Detection history
+    func getDetectionHistory(forDevice device: BluetoothDevice, limit: Int = 100) -> [DeviceDetection] {
+        let request: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
+        request.predicate = NSPredicate(format: "device == %@", device)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = limit
+        return (try? viewContext.fetch(request)) ?? []
+    }
+
+    func getDeviceLogs(forDevice device: BluetoothDevice, limit: Int = 50) -> [DeviceLog] {
+        let request: NSFetchRequest<DeviceLog> = DeviceLog.fetchRequest()
+        request.predicate = NSPredicate(format: "device == %@", device)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = limit
+        return (try? viewContext.fetch(request)) ?? []
+    }
+
+    // MARK: Pattern of life
+    func getDevicePresencePattern(forDevice device: BluetoothDevice, days: Int = 7) -> [Date: Bool] {
+        let endDate = Date()
+        guard let startDate = Calendar.current.date(byAdding: .day, value: -days, to: endDate) else { return [:] }
+        let request: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
+        request.predicate = NSPredicate(format: "device == %@ AND timestamp >= %@ AND timestamp <= %@",
+                                        device, startDate as NSDate, endDate as NSDate)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
+        let detections = (try? viewContext.fetch(request)) ?? []
+
+        let calendar = Calendar.current
+        let presentDays = Set(detections.compactMap { $0.timestamp.map { calendar.startOfDay(for: $0) } })
+        var pattern: [Date: Bool] = [:]
+        var day = calendar.startOfDay(for: startDate)
+        while day <= endDate {
+            pattern[day] = presentDays.contains(day)
+            guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            day = next
+        }
         return pattern
     }
 
-    private func analyzeArrivalDepartureTimes(from detections: [DeviceDetection]) -> [(type: String, time: Date)] {
-        guard !detections.isEmpty else { return [] }
+    func getDeviceArrivalDepartureTimes(forDevice device: BluetoothDevice, date: Date) -> [(type: String, time: Date)] {
+        let startOfDay = Calendar.current.startOfDay(for: date)
+        guard let endOfDay = Calendar.current.date(byAdding: .day, value: 1, to: startOfDay) else { return [] }
+        let request: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
+        request.predicate = NSPredicate(format: "device == %@ AND timestamp >= %@ AND timestamp < %@",
+                                        device, startOfDay as NSDate, endOfDay as NSDate)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
+        let times = ((try? viewContext.fetch(request)) ?? []).compactMap(\.timestamp)
 
         var events: [(type: String, time: Date)] = []
-        var lastDetectionTime: Date?
-
-        for detection in detections {
-            if let timestamp = detection.timestamp {
-                if let lastTime = lastDetectionTime {
-                    let timeGap = timestamp.timeIntervalSince(lastTime)
-
-                    // If gap is greater than departure threshold, record departure and arrival
-                    if timeGap > departureThreshold {
-                        events.append(("departed", lastTime))
-                        events.append(("arrived", timestamp))
-                    }
-                } else {
-                    // First detection of the day
-                    events.append(("arrived", timestamp))
+        var previous: Date?
+        for time in times {
+            if let previous {
+                if time.timeIntervalSince(previous) > departureThreshold {
+                    events.append(("departed", previous))
+                    events.append(("arrived", time))
                 }
-
-                lastDetectionTime = timestamp
+            } else {
+                events.append(("arrived", time))
             }
+            previous = time
         }
-
-        return events.sorted { $0.time < $1.time }
+        return events
     }
 
-    // MARK: - BluetoothManagerDelegate
-    func bluetoothManager(_ manager: BluetoothManager, didDiscover device: BluetoothDeviceInfo) {
-        processDeviceDiscovery(device)
-    }
+    func getDeviceStatistics(forDevice device: BluetoothDevice) -> DeviceStatistics {
+        let countRequest: NSFetchRequest<DeviceDetection> = DeviceDetection.fetchRequest()
+        countRequest.predicate = NSPredicate(format: "device == %@", device)
+        let total = (try? viewContext.count(for: countRequest)) ?? 0
 
-    func bluetoothManager(_ manager: BluetoothManager, didUpdateState state: CBManagerState) {
-        print("DeviceService: Bluetooth state changed to \(state.rawValue)")
+        let recent = getDetectionHistory(forDevice: device, limit: 100)
+        let averageRSSI = recent.isEmpty ? 0 : recent.reduce(0) { $0 + Int($1.rssi) } / recent.count
+        let daysActive = device.firstSeen.map {
+            Calendar.current.dateComponents([.day], from: $0, to: Date()).day ?? 0
+        } ?? 0
 
-        switch state {
-        case .poweredOn:
-            print("✅ Bluetooth is ready - can start scanning")
-            // Auto-start scanning if we were waiting for Bluetooth to be ready
-            if isScanning && !bluetoothManager.isScanning {
-                print("DeviceService: Auto-restarting scan after Bluetooth became ready")
-                bluetoothManager.startScanning()
-            }
-        case .poweredOff:
-            print("❌ Bluetooth is powered off")
-            if isScanning {
-                print("DeviceService: Stopping scan due to Bluetooth being powered off")
-                stopDeviceDiscovery()
-            }
-        case .unauthorized:
-            print("❌ Bluetooth access denied - user needs to grant permissions in Settings")
-        case .unsupported:
-            print("❌ Bluetooth not supported on this device")
-        default:
-            print("⚠️ Bluetooth state: \(state.rawValue)")
-        }
-    }
-
-    func bluetoothManager(_ manager: BluetoothManager, didFailWithError error: Error) {
-        print("DeviceService: Bluetooth error: \(error.localizedDescription)")
+        return DeviceStatistics(totalDetections: total,
+                                averageRSSI: averageRSSI,
+                                lastSeen: device.lastSeen ?? .distantPast,
+                                daysActive: daysActive)
     }
 }
 

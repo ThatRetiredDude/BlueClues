@@ -295,8 +295,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = BluesClues/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app needs Bluetooth access to scan for and track nearby devices.";
-				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app needs Bluetooth access to discover and connect to nearby devices.";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "BlueClues scans for nearby Bluetooth trackers and devices to warn you if one is following you.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "In-motion mode records where each Bluetooth device was seen so it can tell when one is following you, including while your screen is off.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "BlueClues records where each Bluetooth device was seen so it can tell when one is following you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -331,8 +332,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = BluesClues/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app needs Bluetooth access to scan for and track nearby devices.";
-				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app needs Bluetooth access to discover and connect to nearby devices.";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "BlueClues scans for nearby Bluetooth trackers and devices to warn you if one is following you.";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "In-motion mode records where each Bluetooth device was seen so it can tell when one is following you, including while your screen is off.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "BlueClues records where each Bluetooth device was seen so it can tell when one is following you.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

@@ -8,6 +8,8 @@
         <attribute name="lastSeen" optional="NO" attributeType="Date" usesScalarValueType="NO" defaultDateTimeInterval="0"/>
         <attribute name="isFavorite" optional="YES" attributeType="Boolean" usesScalarValueType="YES" defaultValueString="NO"/>
         <attribute name="customNotes" optional="YES" attributeType="String" usesScalarValueType="NO"/>
+        <attribute name="trackerKind" optional="YES" attributeType="String" usesScalarValueType="NO"/>
+        <attribute name="isIgnored" optional="YES" attributeType="Boolean" usesScalarValueType="YES" defaultValueString="NO"/>
         <relationship name="detections" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="DeviceDetection" inverseName="device" inverseEntity="DeviceDetection"/>
         <relationship name="logs" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="DeviceLog" inverseName="device" inverseEntity="DeviceLog"/>
     </entity>

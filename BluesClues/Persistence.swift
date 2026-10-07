@@ -42,22 +42,26 @@ struct PersistenceController {
         if inMemory {
             container.persistentStoreDescriptions.first!.url = URL(fileURLWithPath: "/dev/null")
         }
-        container.loadPersistentStores(completionHandler: { (storeDescription, error) in
-            if let error = error as NSError? {
-                // Replace this implementation with code to handle the error appropriately.
-                // fatalError() causes the application to generate a crash log and terminate. You should not use this function in a shipping application, although it may be useful during development.
+        container.persistentStoreDescriptions.first?.shouldMigrateStoreAutomatically = true
+        container.persistentStoreDescriptions.first?.shouldInferMappingModelAutomatically = true
 
-                /*
-                 Typical reasons for an error here include:
-                 * The parent directory does not exist, cannot be created, or disallows writing.
-                 * The persistent store is not accessible, due to permissions or data protection when the device is locked.
-                 * The device is out of space.
-                 * The store could not be migrated to the current model version.
-                 Check the error message to determine what the actual problem was.
-                 */
-                fatalError("Unresolved error \(error), \(error.userInfo)")
-            }
-        })
+        var loadError: Error?
+        container.loadPersistentStores { _, error in loadError = error }
+
+        // Older builds shipped an unversioned model, so their stores can't be
+        // migrated. Their data was unreliable anyway: start over with a fresh store.
+        if let error = loadError, !inMemory,
+           let url = container.persistentStoreDescriptions.first?.url {
+            print("Persistence: resetting incompatible store: \(error.localizedDescription)")
+            try? container.persistentStoreCoordinator.destroyPersistentStore(at: url, ofType: NSSQLiteStoreType, options: nil)
+            loadError = nil
+            container.loadPersistentStores { _, error in loadError = error }
+        }
+        if let error = loadError {
+            fatalError("Unable to open the BluesClues data store: \(error)")
+        }
+
         container.viewContext.automaticallyMergesChangesFromParent = true
+        container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
 }
