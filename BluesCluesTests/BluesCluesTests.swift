@@ -338,3 +338,124 @@ final class LookalikeTrackerTests: XCTestCase {
         XCTAssertNil(tracker.observations[sig])
     }
 }
+
+final class DeviceIdentifierTests: XCTestCase {
+    private func fields(_ mfr: [UInt8]? = nil, services: [String] = [], serviceData: [String] = [], name: String? = nil) -> AdvertisementFields {
+        AdvertisementFields(manufacturerData: mfr.map { Data($0) }, serviceUUIDs: services,
+                            serviceDataUUIDs: serviceData, localName: name, txPower: nil)
+    }
+
+    func testAirPodsProFromProximityPairing() {
+        let identity = DeviceIdentifier.identify(fields([0x4C, 0x00, 0x07, 0x19, 0x01, 0x0E, 0x20, 0x55]))
+        XCTAssertEqual(identity.manufacturer, "Apple")
+        XCTAssertEqual(identity.category, .earbuds)
+        XCTAssertEqual(identity.model, "AirPods Pro")
+        XCTAssertEqual(identity.confidence, .high)
+    }
+
+    func testBeatsModelIsCreditedToBeats() {
+        let identity = DeviceIdentifier.identify(fields([0x4C, 0x00, 0x07, 0x19, 0x01, 0x0B, 0x20]))
+        XCTAssertEqual(identity.model, "Powerbeats Pro")
+        XCTAssertEqual(identity.manufacturer, "Beats (Apple)")
+    }
+
+    func testAppleNearbyInfoIsHighConfidenceApple() {
+        let identity = DeviceIdentifier.identify(fields([0x4C, 0x00, 0x10, 0x05, 0x01, 0x18]))
+        XCTAssertEqual(identity.manufacturer, "Apple")
+        XCTAssertEqual(identity.confidence, .high)
+        XCTAssertTrue(identity.evidence.contains { $0.contains("Nearby Info") })
+    }
+
+    func testInstantHotspotIsAPhone() {
+        let identity = DeviceIdentifier.identify(fields([0x4C, 0x00, 0x0E, 0x06, 0x00]))
+        XCTAssertEqual(identity.category, .phone)
+    }
+
+    func testSamsungTVFromName() {
+        let identity = DeviceIdentifier.identify(fields(name: "[TV] Samsung 7 Series (55)"))
+        XCTAssertEqual(identity.manufacturer, "Samsung")
+        XCTAssertEqual(identity.category, .tv)
+    }
+
+    func testSamsungCompanyIDPlusBudsNameAgree() {
+        let identity = DeviceIdentifier.identify(fields([0x75, 0x00, 0x01, 0x02], name: "Galaxy Buds2 Pro"))
+        XCTAssertEqual(identity.manufacturer, "Samsung")
+        XCTAssertEqual(identity.category, .earbuds)
+        XCTAssertEqual(identity.confidence, .high)
+    }
+
+    func testChipMakerIsLowConfidence() {
+        let identity = DeviceIdentifier.identify(fields([0x59, 0x00, 0x01]))
+        XCTAssertEqual(identity.manufacturer, "Nordic Semiconductor")
+        XCTAssertEqual(identity.confidence, .low)
+    }
+
+    func testBrandNameBeatsChipMaker() {
+        let ranked = DeviceIdentifier.candidates(for: fields([0x5D, 0x00, 0x01], name: "JBL Flip 6"))
+        XCTAssertEqual(ranked.first?.manufacturer, "JBL (Harman)")
+        XCTAssertEqual(ranked.first?.category, .speaker)
+        XCTAssertTrue(ranked.contains { $0.manufacturer == "Realtek" })
+    }
+
+    func testUnknownCompanyIDIsReported() {
+        let identity = DeviceIdentifier.identify(fields([0x34, 0x12, 0x00]))
+        XCTAssertEqual(identity.manufacturer, "Company 0x1234")
+        XCTAssertEqual(identity.confidence, .low)
+    }
+
+    func testMicrosoftCDPWindowsPC() {
+        let identity = DeviceIdentifier.identify(fields([0x06, 0x00, 0x01, 0x09, 0x20, 0x02]))
+        XCTAssertNil(identity.manufacturer)
+        XCTAssertEqual(identity.category, .computer)
+        XCTAssertEqual(identity.label, "Windows PC")
+    }
+
+    func testTileService() {
+        let identity = DeviceIdentifier.identify(fields(services: ["FEED"]), tracker: .tile)
+        XCTAssertEqual(identity.manufacturer, "Tile")
+        XCTAssertEqual(identity.category, .tracker)
+    }
+
+    func testFastPairAddsTypeToBrand() {
+        let identity = DeviceIdentifier.identify(fields([0xE0, 0x00, 0x01], serviceData: ["FE2C"]))
+        XCTAssertEqual(identity.manufacturer, "Google")
+        XCTAssertEqual(identity.category, .earbuds)
+    }
+
+    func testTeslaKeyName() {
+        let identity = DeviceIdentifier.identify(fields(name: "S0123456789abcdefC"))
+        XCTAssertEqual(identity.manufacturer, "Tesla")
+        XCTAssertEqual(identity.category, .car)
+    }
+
+    func testCarNameWithoutBrand() {
+        let identity = DeviceIdentifier.identify(fields(name: "SYNC 3"))
+        XCTAssertNil(identity.manufacturer)
+        XCTAssertEqual(identity.category, .car)
+    }
+
+    func testHeartRateServiceGivesTypeOnly() {
+        let identity = DeviceIdentifier.identify(fields(services: ["180D"]))
+        XCTAssertNil(identity.manufacturer)
+        XCTAssertEqual(identity.category, .watch)
+    }
+
+    func testNothingAdvertisedIsUnknown() {
+        XCTAssertEqual(DeviceIdentifier.identify(fields()), .unknown)
+        XCTAssertEqual(DeviceIdentity.unknown.label, "Unknown device")
+    }
+
+    func testFieldsMergeKeepsNameAndUnionsServices() {
+        let first = fields([0x75, 0x00], services: ["180F"], name: "Galaxy S24")
+        let later = fields([0x75, 0x00, 0x02], services: ["FE2C"])
+        let merged = first.merged(with: later)
+        XCTAssertEqual(merged.localName, "Galaxy S24")
+        XCTAssertEqual(merged.serviceUUIDs, ["180F", "FE2C"])
+        XCTAssertEqual(merged.manufacturerData, Data([0x75, 0x00, 0x02]))
+    }
+
+    func testFieldsJSONRoundTrip() {
+        let original = fields([0x4C, 0x00, 0x10], services: ["FE9F"], name: "Phone")
+        XCTAssertEqual(AdvertisementFields.fromJSON(original.json), original)
+    }
+}

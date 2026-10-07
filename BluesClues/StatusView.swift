@@ -217,7 +217,7 @@ struct LiveDeviceRow: View {
                             .cornerRadius(4)
                     }
                 }
-                Text(showReason ? device.assessment.reason : (device.tracker?.kind.rawValue ?? "Bluetooth device"))
+                Text(showReason ? device.assessment.reason : subtitle)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -227,6 +227,18 @@ struct LiveDeviceRow: View {
                 .monospacedDigit()
                 .foregroundColor(.secondary)
         }
+    }
+}
+
+extension LiveDeviceRow {
+    /// What the device is, when the title doesn't already say it.
+    var subtitle: String {
+        if let tracker = device.tracker { return tracker.kind.rawValue }
+        let identity = device.identity
+        let hasName = !(device.name ?? "").isEmpty
+        if identity.manufacturer == nil && identity.category == .unknown { return "Bluetooth device" }
+        let text = hasName ? identity.label : (identity.category == .unknown ? "Bluetooth device" : identity.category.rawValue)
+        return identity.confidence == .confirmed ? text : "\(text) · \(identity.confidence.rawValue.lowercased()) confidence"
     }
 }
 

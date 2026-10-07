@@ -122,7 +122,7 @@ struct DeviceRow: View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(device.name ?? device.trackerKind ?? "Unknown Device")
+                    Text(device.name ?? device.trackerKind ?? device.storedIdentity.label)
                         .font(.headline)
                     if device.isFavorite {
                         Image(systemName: "star.fill")
@@ -132,7 +132,9 @@ struct DeviceRow: View {
                     TrustBadge(level: device.trust)
                 }
                 HStack(spacing: 12) {
-                    Text(device.deviceType ?? "Unknown")
+                    Text(device.storedIdentity.manufacturer != nil || device.storedIdentity.category != .unknown
+                         ? device.storedIdentity.label
+                         : device.deviceType ?? "Unknown")
                     if let lastSeen = device.lastSeen {
                         Text("Last seen \(lastSeen, style: .relative) ago")
                     }
@@ -167,7 +169,7 @@ struct DeviceDetailView: View {
                     // Device header
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
-                            Text(device.name ?? "Unknown Device")
+                            Text(device.name ?? device.trackerKind ?? device.storedIdentity.label)
                                 .font(.title)
                                 .fontWeight(.bold)
 
@@ -211,13 +213,17 @@ struct DeviceDetailView: View {
                     .background(Color.gray.opacity(0.1))
                     .cornerRadius(12)
 
+                    IdentitySection(device: device, deviceService: deviceService)
+                        .padding()
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(12)
+
                     // Statistics
                     let stats = deviceService.getDeviceStatistics(forDevice: device)
                     VStack(alignment: .leading, spacing: 16) {
                         Text("Statistics")
                             .font(.headline)
 
-                        InfoRow(label: "Type", value: device.deviceType ?? "Unknown")
                         if let live = deviceService.liveDevice(id: device.uuid ?? "") {
                             InfoRow(label: "Assessment", value: live.assessment.reason)
                         }

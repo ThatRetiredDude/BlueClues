@@ -77,4 +77,35 @@ extension BluetoothDevice {
         get { TrustLevel(rawValue: trustLevel ?? "") ?? .unknown }
         set { trustLevel = newValue.rawValue }
     }
+
+    var advertisementFields: AdvertisementFields? {
+        AdvertisementFields.fromJSON(advertisementJSON)
+    }
+
+    /// What is stored about who made this device: confirmed by the user or
+    /// the latest automatic guess.
+    var storedIdentity: DeviceIdentity {
+        let category = DeviceCategory(rawValue: identifiedCategory ?? "") ?? .unknown
+        guard manufacturer != nil || category != .unknown || identifiedModel != nil else { return .unknown }
+        return DeviceIdentity(
+            manufacturer: manufacturer,
+            category: category,
+            model: identifiedModel,
+            confidence: manufacturerConfirmed ? .confirmed : IdentificationConfidence(rawValue: identityConfidence ?? "") ?? .low,
+            evidence: (identityEvidence ?? "").split(separator: "\n").map(String.init))
+    }
+
+    /// Writes an identity, touching only fields that changed so routine
+    /// sightings don't dirty the object.
+    func store(_ identity: DeviceIdentity, confirmed: Bool) {
+        func set<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<BluetoothDevice, T>, _ value: T) {
+            if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
+        }
+        set(\.manufacturer, identity.manufacturer)
+        set(\.identifiedCategory, identity.category == .unknown ? nil : identity.category.rawValue)
+        set(\.identifiedModel, identity.model)
+        set(\.identityConfidence, confirmed ? nil : identity.confidence.rawValue)
+        set(\.identityEvidence, identity.evidence.isEmpty ? nil : identity.evidence.joined(separator: "\n"))
+        set(\.manufacturerConfirmed, confirmed)
+    }
 }

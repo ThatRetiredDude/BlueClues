@@ -27,10 +27,12 @@ struct LiveDevice: Identifiable, Equatable {
     var lastSeen: Date
     var assessment: FollowAssessment
     var trust: TrustLevel
+    var identity: DeviceIdentity = .unknown
 
     var displayName: String {
         if let name, !name.isEmpty { return name }
-        return tracker?.kind.rawValue ?? "Unknown device"
+        if let tracker { return tracker.kind.rawValue }
+        return identity.label
     }
 
     var isSuspicious: Bool { assessment.isSuspicious && trust.canAlert }
@@ -86,6 +88,8 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     }
     private var liveFlushScheduled = false
     private var sightings: [String: [Sighting]] = [:]
+    /// Advertisement contents per entity, merged across packets.
+    private var adFields: [String: AdvertisementFields] = [:]
     private var lastPersisted: [String: Date] = [:]
     private var lastAlerted: [String: Date] = [:]
     private var departed: Set<String> = []
@@ -212,12 +216,24 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             firstSeen: advertisement.time,
             lastSeen: advertisement.time,
             assessment: FollowAssessment(isSuspicious: false, score: 0, reason: "Just seen"),
-            trust: stored?.trust ?? .unknown
+            trust: stored?.trust ?? .unknown,
+            identity: stored?.storedIdentity ?? .unknown
         )
         entry.rssi = advertisement.rssi
         entry.lastSeen = advertisement.time
         if entry.name == nil { entry.name = advertisement.name }
         if let tracker = advertisement.tracker { entry.tracker = tracker }
+
+        // Re-identify only when the advertisement shows something new, and
+        // never over an identity the user confirmed.
+        let previousFields = adFields[id]
+        let fields = previousFields.map { $0.merged(with: advertisement.fields) } ?? advertisement.fields
+        if fields != previousFields {
+            adFields[id] = fields
+            if entry.identity.confidence != .confirmed {
+                entry.identity = DeviceIdentifier.identify(fields, tracker: entry.tracker?.kind)
+            }
+        }
 
         // Throttle: keep one sighting and one stored detection per interval.
         let lastStored = lastPersisted[id]
@@ -280,6 +296,9 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         if (device.name ?? "").isEmpty, let name = advertisement.name { device.name = name }
         device.deviceType = entry.tracker?.kind.rawValue ?? device.deviceType ?? "Other"
         if let kind = entry.tracker?.kind { device.trackerKind = kind.rawValue }
+        if let json = adFields[entityID]?.json, device.advertisementJSON != json { device.advertisementJSON = json }
+        if let key = advertisement.signature?.key, device.signatureKey != key { device.signatureKey = key }
+        if !device.manufacturerConfirmed { device.store(entry.identity, confirmed: false) }
 
         if isNew {
             createLogEntry(for: device, eventType: "discovered", rssi: advertisement.rssi, metadata: advertisement.summary)
@@ -430,6 +449,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         linker.prune(olderThan: liveRetention, now: now)
         for (id, device) in liveStore where now.timeIntervalSince(device.lastSeen) > liveRetention {
             liveStore[id] = nil
+            adFields[id] = nil
             sightings[id] = nil
             lastPersisted[id] = nil
         }
@@ -509,6 +529,55 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         devicesUpdated.send()
     }
 
+    // MARK: Identification
+    /// Ranked guesses for the detail screen, from the stored advertisement.
+    func manufacturerCandidates(for device: BluetoothDevice) -> [ManufacturerCandidate] {
+        guard let fields = adFields[device.uuid ?? ""] ?? device.advertisementFields else { return [] }
+        return DeviceIdentifier.candidates(for: fields, tracker: device.trackerKind.flatMap(TrackerKind.init(rawValue:)))
+    }
+
+    /// The user's answer to "who made this?". It overrides automatic guesses.
+    func confirmIdentity(uuid: String, manufacturer: String?, category: DeviceCategory, model: String?) {
+        let identity = DeviceIdentity(manufacturer: manufacturer, category: category, model: model,
+                                      confidence: .confirmed, evidence: ["Confirmed by you"])
+        if let device = getDevice(byUUID: uuid) {
+            device.store(identity, confirmed: true)
+            createLogEntry(for: device, eventType: "identified", rssi: liveStore[uuid]?.rssi ?? 0, metadata: identity.label)
+            save()
+        }
+        liveStore[uuid]?.identity = identity
+        devicesUpdated.send()
+    }
+
+    /// Drops a confirmation and goes back to the automatic guess.
+    func clearConfirmedIdentity(uuid: String) {
+        guard let device = getDevice(byUUID: uuid) else { return }
+        let fields = adFields[uuid] ?? device.advertisementFields ?? AdvertisementFields()
+        let identity = DeviceIdentifier.identify(fields, tracker: device.trackerKind.flatMap(TrackerKind.init(rawValue:)))
+        device.store(identity, confirmed: false)
+        save()
+        liveStore[uuid]?.identity = identity
+        devicesUpdated.send()
+    }
+
+    /// Other saved devices that advertise the same coarse signature, e.g. the
+    /// same phone after it changed its Bluetooth address.
+    func devicesSharingSignature(with device: BluetoothDevice) -> [BluetoothDevice] {
+        guard let key = device.signatureKey, let uuid = device.uuid else { return [] }
+        let request: NSFetchRequest<BluetoothDevice> = BluetoothDevice.fetchRequest()
+        request.predicate = NSPredicate(format: "signatureKey == %@ AND uuid != %@ AND manufacturerConfirmed != YES", key, uuid)
+        return (try? viewContext.fetch(request)) ?? []
+    }
+
+    func applyConfirmedIdentity(from device: BluetoothDevice, to others: [BluetoothDevice]) {
+        let identity = device.storedIdentity
+        guard identity.confidence == .confirmed else { return }
+        for other in others {
+            guard let uuid = other.uuid else { continue }
+            confirmIdentity(uuid: uuid, manufacturer: identity.manufacturer, category: identity.category, model: identity.model)
+        }
+    }
+
     func trust(forUUID uuid: String) -> TrustLevel {
         liveStore[uuid]?.trust ?? getDevice(byUUID: uuid)?.trust ?? .unknown
     }
@@ -526,6 +595,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         departed.removeAll()
         linker = EntityLinker()
         lookalikes.reset()
+        adFields.removeAll()
         lookalikeStore.removeAll()
         devicesUpdated.send()
         detectionsUpdated.send()
@@ -538,19 +608,33 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         guard let detections = try? viewContext.fetch(request) else { return nil }
 
         let iso = ISO8601DateFormatter()
-        var csv = "timestamp,device_id,name,type,rssi,latitude,longitude\n"
+        func quoted(_ value: String?) -> String {
+            "\"" + (value ?? "").replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        var csv = "timestamp,device_id,name,type,rssi,latitude,longitude,"
+            + "manufacturer,identified_type,model,identity_confidence,identity_confirmed,identity_evidence,"
+            + "trust,signature,raw_advertisement\n"
         for detection in detections {
             let device = detection.device
-            let name = (device?.name ?? "").replacingOccurrences(of: "\"", with: "\"\"")
+            let identity = device?.storedIdentity
             let hasFix = detection.latitude != 0 || detection.longitude != 0
             csv += [
                 detection.timestamp.map { iso.string(from: $0) } ?? "",
                 device?.uuid ?? "",
-                "\"\(name)\"",
-                device?.deviceType ?? "",
+                quoted(device?.name),
+                quoted(device?.deviceType),
                 "\(detection.rssi)",
                 hasFix ? "\(detection.latitude)" : "",
-                hasFix ? "\(detection.longitude)" : ""
+                hasFix ? "\(detection.longitude)" : "",
+                quoted(identity?.manufacturer),
+                quoted(identity.map { $0.category == .unknown ? "" : $0.category.rawValue }),
+                quoted(identity?.model),
+                quoted(identity?.confidence.rawValue),
+                device?.manufacturerConfirmed == true ? "yes" : "no",
+                quoted(identity?.evidence.joined(separator: "; ")),
+                device?.trust.rawValue ?? "",
+                quoted(device?.signatureKey),
+                quoted(device?.advertisementJSON)
             ].joined(separator: ",") + "\n"
         }
 
