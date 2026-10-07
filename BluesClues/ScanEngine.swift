@@ -82,6 +82,18 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
         locationManager.stopMonitoringSignificantLocationChanges()
     }
 
+    /// In stationary mode, asks for a fresh fix when the last one is older
+    /// than `maxAge` (in motion, continuous updates keep it fresh).
+    func refreshLocationIfStale(maxAge: TimeInterval = 5 * 60) {
+        guard wantsScanning, mode == .stationary else { return }
+        switch locationManager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: break
+        default: return
+        }
+        if let lastLocation, Date().timeIntervalSince(lastLocation.timestamp) < maxAge { return }
+        locationManager.requestLocation()
+    }
+
     func setMode(_ mode: ScanMode) {
         self.mode = mode
         if wantsScanning { startLocation() }
@@ -127,6 +139,9 @@ final class ScanEngine: NSObject, CBCentralManagerDelegate, CLLocationManagerDel
             locationManager.stopUpdatingLocation()
             locationManager.allowsBackgroundLocationUpdates = false
             locationManager.startMonitoringSignificantLocationChanges()
+            // Significant changes may not fire for a long time while sitting
+            // still, so get a fix now for sightings and logs.
+            locationManager.requestLocation()
         }
     }
 

@@ -323,6 +323,11 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         log.eventType = eventType
         log.rssi = Int16(clamping: rssi)
         log.metadata = metadata
+        if let location = engine.lastLocation {
+            log.latitude = location.coordinate.latitude
+            log.longitude = location.coordinate.longitude
+            log.hasLocation = true
+        }
         log.device = device
     }
 
@@ -437,6 +442,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     // MARK: Housekeeping
     private func housekeeping() {
         let now = Date()
+        engine.refreshLocationIfStale()
         for (id, device) in liveStore where !departed.contains(id) && now.timeIntervalSince(device.lastSeen) > departureThreshold {
             departed.insert(id)
             if let stored = getDevice(byUUID: id) {
@@ -665,6 +671,17 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         return (try? viewContext.fetch(request)) ?? []
     }
 
+    // MARK: Places
+    /// Where a device has been seen, grouped into places `radius` apart,
+    /// most recent first.
+    func placesSeen(for device: BluetoothDevice, radius: Double = 250, limit: Int = 2000) -> [PlaceSeen] {
+        let detections = getDetectionHistory(forDevice: device, limit: limit)
+            .filter { $0.latitude != 0 || $0.longitude != 0 }
+        return PlaceSeen.group(detections.compactMap { detection in
+            detection.timestamp.map { Sighting(time: $0, latitude: detection.latitude, longitude: detection.longitude, rssi: Int(detection.rssi)) }
+        }, radius: radius)
+    }
+
     // MARK: Pattern of life
     func getDevicePresencePattern(forDevice device: BluetoothDevice, days: Int = 7) -> [Date: Bool] {
         let endDate = Date()
@@ -731,6 +748,38 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
 }
 
 // MARK: - Supporting Types
+struct PlaceSeen: Identifiable, Equatable {
+    var id: String { "\(latitude),\(longitude)" }
+    let latitude: Double
+    let longitude: Double
+    var firstSeen: Date
+    var lastSeen: Date
+    var sightings: Int
+
+    var mapsURL: URL? {
+        URL(string: "https://maps.apple.com/?ll=\(latitude),\(longitude)&q=Seen%20here")
+    }
+
+    /// Greedy clustering like FollowDetector.distinctPlaces, keeping each
+    /// place's time range. Sightings without a fix are skipped.
+    static func group(_ sightings: [Sighting], radius: Double) -> [PlaceSeen] {
+        var places: [PlaceSeen] = []
+        for sighting in sightings.sorted(by: { $0.time < $1.time }) {
+            guard let lat = sighting.latitude, let lon = sighting.longitude else { continue }
+            if let index = places.firstIndex(where: {
+                FollowDetector.distanceMeters(lat1: $0.latitude, lon1: $0.longitude, lat2: lat, lon2: lon) <= radius
+            }) {
+                places[index].lastSeen = max(places[index].lastSeen, sighting.time)
+                places[index].sightings += 1
+            } else {
+                places.append(PlaceSeen(latitude: lat, longitude: lon, firstSeen: sighting.time, lastSeen: sighting.time, sightings: 1))
+            }
+        }
+        return places.sorted { $0.lastSeen > $1.lastSeen }
+    }
+}
+
+
 struct DeviceStatistics {
     let totalDetections: Int
     let averageRSSI: Int

@@ -218,6 +218,11 @@ struct DeviceDetailView: View {
                         .background(Color.gray.opacity(0.1))
                         .cornerRadius(12)
 
+                    PlacesSeenSection(places: deviceService.placesSeen(for: device))
+                        .padding()
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(12)
+
                     // Statistics
                     let stats = deviceService.getDeviceStatistics(forDevice: device)
                     VStack(alignment: .leading, spacing: 16) {

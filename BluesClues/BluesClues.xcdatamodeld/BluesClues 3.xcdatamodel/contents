@@ -35,6 +35,9 @@
         <attribute name="eventType" optional="NO" attributeType="String" usesScalarValueType="NO" defaultValueString=""/>
         <attribute name="rssi" optional="YES" attributeType="Integer 16" usesScalarValueType="YES" defaultValueString="0"/>
         <attribute name="metadata" optional="YES" attributeType="String" usesScalarValueType="NO"/>
+        <attribute name="latitude" optional="YES" attributeType="Double" usesScalarValueType="YES" defaultValueString="0.0"/>
+        <attribute name="longitude" optional="YES" attributeType="Double" usesScalarValueType="YES" defaultValueString="0.0"/>
+        <attribute name="hasLocation" optional="YES" attributeType="Boolean" usesScalarValueType="YES" defaultValueString="NO"/>
         <relationship name="device" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="BluetoothDevice" inverseName="logs" inverseEntity="BluetoothDevice"/>
     </entity>
     <elements>

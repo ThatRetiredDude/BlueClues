@@ -459,3 +459,22 @@ final class DeviceIdentifierTests: XCTestCase {
         XCTAssertEqual(AdvertisementFields.fromJSON(original.json), original)
     }
 }
+
+final class PlaceSeenTests: XCTestCase {
+    private let start = Date(timeIntervalSince1970: 1_700_000_000)
+
+    func testGroupsNearbySightingsAndKeepsTimeRange() {
+        let sightings = [
+            Sighting(time: start, latitude: 40.0000, longitude: -75.0, rssi: -60),
+            Sighting(time: start.addingTimeInterval(60), latitude: 40.0005, longitude: -75.0, rssi: -60),
+            Sighting(time: start.addingTimeInterval(600), latitude: 40.0100, longitude: -75.0, rssi: -60),
+            Sighting(time: start.addingTimeInterval(900), latitude: nil, longitude: nil, rssi: -60)
+        ]
+        let places = PlaceSeen.group(sightings, radius: 250)
+        XCTAssertEqual(places.count, 2)
+        // Most recent first.
+        XCTAssertEqual(places[0].latitude, 40.0100, accuracy: 0.00001)
+        XCTAssertEqual(places[1].sightings, 2)
+        XCTAssertEqual(places[1].lastSeen, start.addingTimeInterval(60))
+    }
+}

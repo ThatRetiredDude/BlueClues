@@ -358,6 +358,15 @@ struct LogRowView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
+                        if log.hasLocation {
+                            Label(String(format: "%.5f, %.5f", log.latitude, log.longitude), systemImage: "mappin.and.ellipse")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Label("No location", systemImage: "location.slash")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                         Spacer()
                         Image(systemName: "chevron.right")
                             .font(.caption)
@@ -436,6 +445,32 @@ struct LogDetailView: View {
                         .background(Color.gray.opacity(0.1))
                         .cornerRadius(8)
                     }
+
+                    // Location
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Location")
+                            .font(.headline)
+                        if log.hasLocation {
+                            PlaceMap(places: [PlaceSeen(latitude: log.latitude, longitude: log.longitude,
+                                                        firstSeen: log.timestamp ?? Date(), lastSeen: log.timestamp ?? Date(),
+                                                        sightings: 1)])
+                                .frame(height: 180)
+                                .cornerRadius(8)
+                            InfoRow(label: "Coordinates", value: String(format: "%.5f, %.5f", log.latitude, log.longitude))
+                            if let url = URL(string: "https://maps.apple.com/?ll=\(log.latitude),\(log.longitude)&q=Logged%20here") {
+                                Link(destination: url) {
+                                    Label("Open in Maps", systemImage: "map")
+                                }
+                            }
+                        } else {
+                            Text("No location was available when this was logged. Older entries and times without a location fix have none.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(8)
 
                     // Log details
                     VStack(alignment: .leading, spacing: 12) {
