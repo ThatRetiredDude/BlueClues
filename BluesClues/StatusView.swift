@@ -69,6 +69,7 @@ struct StatusView: View {
                             LiveDeviceRow(device: device, showReason: true)
                                 .contentShape(Rectangle())
                                 .onTapGesture { selectedDeviceID = device.id }
+                                .trustSwipeActions(uuid: device.id, deviceService: deviceService)
                         }
                     }
                 }
@@ -83,6 +84,7 @@ struct StatusView: View {
                             LiveDeviceRow(device: device, showReason: false)
                                 .contentShape(Rectangle())
                                 .onTapGesture { selectedDeviceID = device.id }
+                                .trustSwipeActions(uuid: device.id, deviceService: deviceService)
                         }
                     }
                 }
@@ -96,6 +98,7 @@ struct StatusView: View {
                             LiveDeviceRow(device: device, showReason: false)
                                 .contentShape(Rectangle())
                                 .onTapGesture { selectedDeviceID = device.id }
+                                .trustSwipeActions(uuid: device.id, deviceService: deviceService)
                         }
                     }
                 }
@@ -201,6 +204,7 @@ struct LiveDeviceRow: View {
                 HStack(spacing: 6) {
                     Text(device.displayName)
                         .font(.headline)
+                    TrustBadge(level: device.trust)
                     if device.tracker?.separatedFromOwner == true {
                         Text("Away from owner")
                             .font(.caption2)
@@ -219,6 +223,50 @@ struct LiveDeviceRow: View {
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - Trust Badge
+struct TrustBadge: View {
+    let level: TrustLevel
+
+    var body: some View {
+        if level != .unknown {
+            Label(level.title, systemImage: level.systemImage)
+                .labelStyle(.titleAndIcon)
+                .font(.caption2)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(color.opacity(0.2))
+                .foregroundColor(color)
+                .cornerRadius(4)
+        }
+    }
+
+    private var color: Color {
+        switch level {
+        case .unknown: return .secondary
+        case .mine: return .blue
+        case .friendly: return .green
+        case .questionable: return .orange
+        }
+    }
+}
+
+// MARK: - Trust Swipe Actions
+extension View {
+    func trustSwipeActions(uuid: String, deviceService: DeviceService) -> some View {
+        swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            ForEach([TrustLevel.questionable, .friendly, .mine]) { level in
+                Button {
+                    let current = deviceService.trust(forUUID: uuid)
+                    deviceService.setTrust(uuid: uuid, level: current == level ? .unknown : level)
+                } label: {
+                    Label(level.title, systemImage: level.systemImage)
+                }
+                .tint(level == .mine ? .blue : level == .friendly ? .green : .orange)
+            }
         }
     }
 }

@@ -101,6 +101,49 @@ final class FollowDetectorTests: XCTestCase {
         XCTAssertFalse(result.isSuspicious)
     }
 
+    func testInMotionFlagsDeviceSeenAtTwoPlaces() {
+        // About 1 km apart, 6 minutes apart.
+        let sightings = [sighting(0, 40.000, -75.000), sighting(6, 40.009, -75.000)]
+        let result = FollowDetector.assess(sightings, mode: .inMotion, now: start.addingTimeInterval(6 * 60))
+        XCTAssertTrue(result.isSuspicious)
+    }
+
+    func testInMotionOutAndBackIsNotSuspicious() {
+        // Seen at home, then again at home 20 minutes later after a walk
+        // where it wasn't heard: still one place.
+        let sightings = [sighting(0, 40.0000, -75.000), sighting(20, 40.0010, -75.000)]
+        let result = FollowDetector.assess(sightings, mode: .inMotion, now: start.addingTimeInterval(20 * 60))
+        XCTAssertFalse(result.isSuspicious)
+        XCTAssertEqual(FollowDetector.distinctPlaces(sightings, radius: 250), 1)
+    }
+
+    func testStationaryFlagsThreeSeparateVisits() {
+        // Three short visits, each separated by more than 10 minutes.
+        let sightings = [0.0, 1, 2, 15, 16, 30, 31, 32].map { sighting($0, nil, nil) }
+        let result = FollowDetector.assess(sightings, mode: .stationary, now: start.addingTimeInterval(32 * 60))
+        XCTAssertTrue(result.isSuspicious)
+        XCTAssertEqual(FollowDetector.visitCount(sightings, gap: 600), 3)
+        XCTAssertTrue(result.reason.hasPrefix("Came and went 3 times"))
+    }
+
+    func testStationaryTwoVisitsAreNotEnough() {
+        let sightings = [0.0, 1, 2, 15, 16].map { sighting($0, nil, nil) }
+        let result = FollowDetector.assess(sightings, mode: .stationary, now: start.addingTimeInterval(16 * 60))
+        XCTAssertFalse(result.isSuspicious)
+    }
+
+    func testStationaryShortGapsAreOneVisit() {
+        // Gaps of exactly 10 minutes don't start a new visit.
+        let sightings = [0.0, 10, 20, 30].map { sighting($0, nil, nil) }
+        XCTAssertEqual(FollowDetector.visitCount(sightings, gap: 600), 1)
+    }
+
+    func testStationaryVisitsOlderThanADayDontCount() {
+        let sightings = [0.0, 20, 40].map { sighting($0, nil, nil) }
+        let result = FollowDetector.assess(sightings, mode: .stationary, now: start.addingTimeInterval(25 * 60 * 60))
+        XCTAssertFalse(result.isSuspicious)
+    }
+
     func testDistance() {
         // One degree of latitude is about 111 km.
         XCTAssertEqual(FollowDetector.distanceMeters(lat1: 0, lon1: 0, lat2: 1, lon2: 0), 111_195, accuracy: 100)
@@ -154,5 +197,25 @@ final class EntityLinkerTests: XCTestCase {
         let first = linker.entityID(forPeripheral: "A", kind: nil, rssi: -60, at: start)
         let again = linker.entityID(forPeripheral: "A", kind: nil, rssi: -80, at: start.addingTimeInterval(5))
         XCTAssertEqual(first, again)
+    }
+}
+
+final class AlertPolicyTests: XCTestCase {
+    func testMineAndFriendlyNeverAlert() {
+        for scope in AlertScope.allCases {
+            XCTAssertFalse(AlertPolicy.isEligible(trust: .mine, isTracker: true, scope: scope))
+            XCTAssertFalse(AlertPolicy.isEligible(trust: .friendly, isTracker: true, scope: scope))
+        }
+    }
+
+    func testAllUnknownDevicesScope() {
+        XCTAssertTrue(AlertPolicy.isEligible(trust: .unknown, isTracker: false, scope: .allUnknown))
+        XCTAssertTrue(AlertPolicy.isEligible(trust: .questionable, isTracker: false, scope: .allUnknown))
+    }
+
+    func testTrackersOnlyScope() {
+        XCTAssertFalse(AlertPolicy.isEligible(trust: .unknown, isTracker: false, scope: .trackersOnly))
+        XCTAssertFalse(AlertPolicy.isEligible(trust: .questionable, isTracker: false, scope: .trackersOnly))
+        XCTAssertTrue(AlertPolicy.isEligible(trust: .unknown, isTracker: true, scope: .trackersOnly))
     }
 }

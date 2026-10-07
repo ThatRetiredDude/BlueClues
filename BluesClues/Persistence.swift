@@ -61,7 +61,20 @@ struct PersistenceController {
             fatalError("Unable to open the BluesClues data store: \(error)")
         }
 
+        // Model version 2 replaced the "this is mine" flag with trust levels.
+        let upgrade = NSBatchUpdateRequest(entityName: "BluetoothDevice")
+        upgrade.predicate = NSPredicate(format: "isIgnored == YES")
+        upgrade.propertiesToUpdate = ["trustLevel": TrustLevel.mine.rawValue, "isIgnored": false]
+        _ = try? container.viewContext.execute(upgrade)
+
         container.viewContext.automaticallyMergesChangesFromParent = true
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+    }
+}
+
+extension BluetoothDevice {
+    var trust: TrustLevel {
+        get { TrustLevel(rawValue: trustLevel ?? "") ?? .unknown }
+        set { trustLevel = newValue.rawValue }
     }
 }

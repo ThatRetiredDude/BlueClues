@@ -109,6 +109,7 @@ struct DevicesView: View {
         DeviceRow(device: device, live: device.uuid.flatMap { deviceService.liveDevice(id: $0) })
             .contentShape(Rectangle())
             .onTapGesture { selectedDevice = device }
+            .trustSwipeActions(uuid: device.uuid ?? "", deviceService: deviceService)
     }
 }
 
@@ -128,11 +129,7 @@ struct DeviceRow: View {
                             .foregroundColor(.yellow)
                             .font(.caption)
                     }
-                    if device.isIgnored {
-                        Image(systemName: "person.crop.circle.badge.checkmark")
-                            .foregroundColor(.secondary)
-                            .font(.caption)
-                    }
+                    TrustBadge(level: device.trust)
                 }
                 HStack(spacing: 12) {
                     Text(device.deviceType ?? "Unknown")
@@ -193,13 +190,20 @@ struct DeviceDetailView: View {
                     .background(Color.gray.opacity(0.1))
                     .cornerRadius(12)
 
-                    // Known / ignore
+                    // Trust
                     VStack(alignment: .leading, spacing: 8) {
-                        Toggle("This is mine (never alert)", isOn: Binding(
-                            get: { device.isIgnored },
-                            set: { deviceService.setIgnored(uuid: device.uuid ?? "", ignored: $0) }
-                        ))
-                        Text("Use this for your own and your household's devices.")
+                        Text("Trust")
+                            .font(.headline)
+                        Picker("Trust", selection: Binding(
+                            get: { device.trust },
+                            set: { deviceService.setTrust(uuid: device.uuid ?? "", level: $0) }
+                        )) {
+                            ForEach(TrustLevel.allCases) { level in
+                                Text(level.title).tag(level)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        Text("Mine and Friendly never alert. Questionable alerts every time the device shows up.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -306,13 +310,17 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section(header: Text("Detection"),
-                        footer: Text("Off: only known tracker types (Tile, SmartTag, Find My, Google, Chipolo) raise alerts. On: any Bluetooth device can, which also catches a person carrying a phone but is noisier.")) {
+                        footer: Text("All unknown devices: any Bluetooth device you haven't labeled Mine or Friendly can alert, which also catches a person carrying a phone. Trackers only: just Tile, SmartTag, Find My, Google and Chipolo tags.")) {
                     Picker("Mode", selection: $deviceService.mode) {
                         ForEach(ScanMode.allCases) { mode in
                             Text(mode.rawValue).tag(mode)
                         }
                     }
-                    Toggle("Alert on any device", isOn: $deviceService.alertOnAllDevices)
+                    Picker("Alert on", selection: $deviceService.alertScope) {
+                        ForEach(AlertScope.allCases) { scope in
+                            Text(scope.rawValue).tag(scope)
+                        }
+                    }
                 }
 
                 Section(header: Text("Status")) {

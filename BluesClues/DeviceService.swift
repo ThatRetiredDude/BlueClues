@@ -26,14 +26,14 @@ struct LiveDevice: Identifiable, Equatable {
     var firstSeen: Date
     var lastSeen: Date
     var assessment: FollowAssessment
-    var isIgnored: Bool
+    var trust: TrustLevel
 
     var displayName: String {
         if let name, !name.isEmpty { return name }
         return tracker?.kind.rawValue ?? "Unknown device"
     }
 
-    var isSuspicious: Bool { assessment.isSuspicious && !isIgnored }
+    var isSuspicious: Bool { assessment.isSuspicious && trust.canAlert }
 }
 
 // MARK: - Device Service
@@ -52,8 +52,8 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             reassessAll()
         }
     }
-    @Published var alertOnAllDevices: Bool {
-        didSet { UserDefaults.standard.set(alertOnAllDevices, forKey: Keys.alertOnAllDevices) }
+    @Published var alertScope: AlertScope {
+        didSet { UserDefaults.standard.set(alertScope.rawValue, forKey: Keys.alertScope) }
     }
 
     let devicesUpdated = PassthroughSubject<Void, Never>()
@@ -63,7 +63,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     private enum Keys {
         static let mode = "scanMode"
         static let scanningEnabled = "scanningEnabled"
-        static let alertOnAllDevices = "alertOnAllDevices"
+        static let alertScope = "alertScope"
     }
 
     private let persistenceController: PersistenceController
@@ -86,8 +86,9 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     private let departureThreshold: TimeInterval = 10 * 60
     /// Don't re-alert on the same device within this window.
     private let realertInterval: TimeInterval = 30 * 60
-    /// Drop live entries not seen for this long.
-    private let liveRetention: TimeInterval = 6 * 60 * 60
+    /// Drop live entries not seen for this long. Matches the stationary
+    /// lookback so repeat visits across a day are still counted.
+    private let liveRetention: TimeInterval = 24 * 60 * 60
     /// Stored detections older than this are deleted.
     private let historyRetentionDays = 60
 
@@ -99,7 +100,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         self.engine = ScanEngine()
         let defaults = UserDefaults.standard
         self.mode = ScanMode(rawValue: defaults.string(forKey: Keys.mode) ?? "") ?? .inMotion
-        self.alertOnAllDevices = defaults.bool(forKey: Keys.alertOnAllDevices)
+        self.alertScope = AlertScope(rawValue: defaults.string(forKey: Keys.alertScope) ?? "") ?? .allUnknown
         self.engine.delegate = self
         self.locationAuthorization = engine.locationAuthorization
 
@@ -149,10 +150,19 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     }
 
     // MARK: Live views
+    /// Devices that pass the detector rules, plus questionable devices that are
+    /// nearby right now.
     var suspiciousDevices: [LiveDevice] {
         liveDevices.values
-            .filter { $0.isSuspicious && (alertOnAllDevices || $0.tracker != nil) }
+            .filter { device in
+                isAlertEligible(device) && (device.isSuspicious
+                    || (device.trust == .questionable && Date().timeIntervalSince(device.lastSeen) < 120))
+            }
             .sorted { $0.assessment.score > $1.assessment.score }
+    }
+
+    func isAlertEligible(_ device: LiveDevice) -> Bool {
+        AlertPolicy.isEligible(trust: device.trust, isTracker: device.tracker != nil, scope: alertScope)
     }
 
     var nearbyTrackers: [LiveDevice] {
@@ -176,6 +186,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
                                  rssi: advertisement.rssi,
                                  at: advertisement.time)
         let previousSeen = liveStore[id]?.lastSeen
+        let stored = previousSeen == nil ? getDevice(byUUID: id) : nil
 
         var entry = liveStore[id] ?? LiveDevice(
             id: id,
@@ -185,7 +196,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             firstSeen: advertisement.time,
             lastSeen: advertisement.time,
             assessment: FollowAssessment(isSuspicious: false, score: 0, reason: "Just seen"),
-            isIgnored: getDevice(byUUID: id)?.isIgnored ?? false
+            trust: stored?.trust ?? .unknown
         )
         entry.rssi = advertisement.rssi
         entry.lastSeen = advertisement.time
@@ -205,8 +216,15 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         }
 
         liveStore[id] = entry
-        if entry.isSuspicious && (alertOnAllDevices || entry.tracker != nil) {
+        guard isAlertEligible(entry) else { return }
+        if entry.isSuspicious {
             raiseAlertIfNeeded(for: entry)
+        } else if entry.trust == .questionable {
+            // Questionable devices alert on every new arrival.
+            let lastKnown = previousSeen ?? stored?.lastSeen
+            if lastKnown == nil || advertisement.time.timeIntervalSince(lastKnown!) > departureThreshold {
+                raiseAlertIfNeeded(for: entry, reason: "Questionable device arrived")
+            }
         }
     }
 
@@ -229,6 +247,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             device.uuid = entityID
             device.firstSeen = advertisement.time
             device.isFavorite = false
+            device.trust = entry.trust
             isNew = true
         }
 
@@ -284,19 +303,24 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
     }
 
     // MARK: Alerts
-    private func raiseAlertIfNeeded(for device: LiveDevice) {
+    private func raiseAlertIfNeeded(for device: LiveDevice, reason: String? = nil) {
+        let reason = reason ?? device.assessment.reason
         let now = Date()
         if let last = lastAlerted[device.id], now.timeIntervalSince(last) < realertInterval { return }
         lastAlerted[device.id] = now
 
         if let stored = getDevice(byUUID: device.id) {
-            createLogEntry(for: stored, eventType: "suspicious", rssi: device.rssi, metadata: device.assessment.reason)
+            createLogEntry(for: stored, eventType: "suspicious", rssi: device.rssi, metadata: reason)
             save()
         }
 
         let content = UNMutableNotificationContent()
-        content.title = mode == .inMotion ? "Possible tracker following you" : "Unfamiliar device staying nearby"
-        content.body = "\(device.displayName): \(device.assessment.reason)."
+        if device.trust == .questionable && !device.isSuspicious {
+            content.title = "Questionable device nearby"
+        } else {
+            content.title = mode == .inMotion ? "Possible tracker following you" : "Unfamiliar device staying nearby"
+        }
+        content.body = "\(device.displayName): \(reason)."
         content.sound = .default
         let request = UNNotificationRequest(identifier: "suspicious-\(device.id)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -335,7 +359,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             lastPersisted[id] = nil
         }
         for id in sightings.keys {
-            sightings[id]?.removeAll { now.timeIntervalSince($0.time) > config.lookback }
+            sightings[id]?.removeAll { now.timeIntervalSince($0.time) > config.maxLookback }
         }
         reassessAll(now: now)
     }
@@ -389,13 +413,20 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         save()
     }
 
-    /// Marks a device as yours (or otherwise known), so it never raises alerts.
-    func setIgnored(uuid: String, ignored: Bool) {
+    /// Labels a device. Mine and friendly devices never raise alerts;
+    /// questionable ones alert every time they arrive.
+    func setTrust(uuid: String, level: TrustLevel) {
         if let device = getDevice(byUUID: uuid) {
-            device.isIgnored = ignored
+            device.trust = level
+            createLogEntry(for: device, eventType: "labeled", rssi: liveStore[uuid]?.rssi ?? 0, metadata: level.title)
             save()
         }
-        liveStore[uuid]?.isIgnored = ignored
+        liveStore[uuid]?.trust = level
+        devicesUpdated.send()
+    }
+
+    func trust(forUUID uuid: String) -> TrustLevel {
+        liveStore[uuid]?.trust ?? getDevice(byUUID: uuid)?.trust ?? .unknown
     }
 
     func clearAllData() {
