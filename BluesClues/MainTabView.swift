@@ -46,7 +46,7 @@ struct DevicesView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(key: "lastSeen", ascending: false)])
     private var devices: FetchedResults<BluetoothDevice>
     @State private var selectedDevice: BluetoothDevice?
-    @State private var showTrackersOnly = true
+    @State private var showTrackersOnly = false
 
     var body: some View {
         NavigationStack {

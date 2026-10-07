@@ -85,11 +85,18 @@ struct StatusView: View {
                                 .onTapGesture { selectedDeviceID = device.id }
                         }
                     }
-                    HStack {
-                        Text("Other Bluetooth devices in range")
-                        Spacer()
-                        Text("\(deviceService.nearbyOtherCount)")
+                }
+
+                Section(header: Text("Nearby devices")) {
+                    if deviceService.nearbyOthers.isEmpty {
+                        Text(deviceService.isScanning ? "No other devices in range" : "Start scanning to see nearby devices")
                             .foregroundColor(.secondary)
+                    } else {
+                        ForEach(deviceService.nearbyOthers) { device in
+                            LiveDeviceRow(device: device, showReason: false)
+                                .contentShape(Rectangle())
+                                .onTapGesture { selectedDeviceID = device.id }
+                        }
                     }
                 }
             }

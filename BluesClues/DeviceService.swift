@@ -161,8 +161,10 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
             .sorted { $0.rssi > $1.rssi }
     }
 
-    var nearbyOtherCount: Int {
-        liveDevices.values.filter { $0.tracker == nil && Date().timeIntervalSince($0.lastSeen) < 120 }.count
+    var nearbyOthers: [LiveDevice] {
+        liveDevices.values
+            .filter { $0.tracker == nil && Date().timeIntervalSince($0.lastSeen) < 120 }
+            .sorted { $0.rssi > $1.rssi }
     }
 
     func liveDevice(id: String) -> LiveDevice? { liveStore[id] }
