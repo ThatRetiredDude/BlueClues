@@ -334,6 +334,10 @@ struct SettingsView: View {
                     }
                 }
 
+                AISettingsSection()
+
+                ICloudSettingsSection()
+
                 Section(header: Text("Status")) {
                     HStack {
                         Text("Bluetooth")

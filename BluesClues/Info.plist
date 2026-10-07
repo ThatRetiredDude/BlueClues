@@ -6,6 +6,16 @@
 	<array>
 		<string>bluetooth-central</string>
 		<string>location</string>
+		<string>remote-notification</string>
 	</array>
+	<key>BlueCluesCloudKitContainer</key>
+	<string>$(BLUECLUES_CLOUDKIT_CONTAINER)</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>BlueClues connects to an AI server on your local network only if you set one up in Settings.</string>
 </dict>
 </plist>

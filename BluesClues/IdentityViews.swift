@@ -12,8 +12,10 @@ import SwiftUI
 struct IdentitySection: View {
     @ObservedObject var device: BluetoothDevice
     @ObservedObject var deviceService: DeviceService
+    @EnvironmentObject var ai: AIAssistant
     @State private var enteringOwn = false
     @State private var showingRaw = false
+    @State private var askingAI = false
 
     var body: some View {
         let identity = device.storedIdentity
@@ -78,12 +80,26 @@ struct IdentitySection: View {
             }
 
             Divider()
-            Button {
-                enteringOwn = true
-            } label: {
-                Label("Enter it myself", systemImage: "pencil")
+            HStack {
+                Button {
+                    enteringOwn = true
+                } label: {
+                    Label("Enter it myself", systemImage: "pencil")
+                }
+                Spacer()
+                Button {
+                    askingAI = true
+                } label: {
+                    Label("Ask AI", systemImage: "sparkles")
+                }
+                .disabled(ai.engine == .off || device.advertisementFields == nil)
             }
             .font(.subheadline)
+            if ai.engine == .off {
+                Text("Turn on the AI assistant in Settings to ask for a second opinion.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
 
             DisclosureGroup("Raw advertisement", isExpanded: $showingRaw) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -101,6 +117,9 @@ struct IdentitySection: View {
         }
         .sheet(isPresented: $enteringOwn) {
             ManualIdentityView(device: device, deviceService: deviceService)
+        }
+        .sheet(isPresented: $askingAI) {
+            AskAIView(device: device, deviceService: deviceService)
         }
     }
 }
@@ -203,6 +222,111 @@ struct ManualIdentityView: View {
                 model = identity.model ?? ""
                 category = identity.category
             }
+        }
+    }
+}
+
+// MARK: - Ask AI
+/// Shows exactly what will be sent and where, sends only on request, and
+/// lets the user accept the answer as the device's identity.
+struct AskAIView: View {
+    let device: BluetoothDevice
+    let deviceService: DeviceService
+    @EnvironmentObject var ai: AIAssistant
+    @Environment(\.dismiss) private var dismiss
+    @State private var includeName = true
+    @State private var isSending = false
+    @State private var suggestion: AIDeviceSuggestion?
+    @State private var errorText: String?
+
+    private var fields: AdvertisementFields { device.advertisementFields ?? AdvertisementFields() }
+
+    private var prompt: String {
+        AIPrompts.devicePrompt(fields: fields,
+                               candidates: deviceService.manufacturerCandidates(for: device),
+                               includeName: includeName)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("Sent to")) {
+                    Text(ai.destinationDescription)
+                }
+
+                if let name = fields.localName, !name.isEmpty {
+                    Section(footer: Text("Device names can be personal (like \"Jane's AirPods\"). Leave it out if you'd rather not share it.")) {
+                        Toggle("Include the name \"\(name)\"", isOn: $includeName)
+                    }
+                }
+
+                Section(header: Text("Exactly what will be sent"),
+                        footer: Text("No locations, times, signal strengths or device IDs are sent.")) {
+                    Text(prompt)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+
+                if let suggestion {
+                    Section(header: Text("AI suggestion")) {
+                        HStack {
+                            Text(DeviceIdentity(manufacturer: suggestion.manufacturer, category: suggestion.category,
+                                                model: suggestion.model, confidence: suggestion.confidence, evidence: []).label)
+                                .font(.headline)
+                            Spacer()
+                            ConfidenceBadge(confidence: suggestion.confidence)
+                        }
+                        if !suggestion.reasoning.isEmpty {
+                            Text(suggestion.reasoning).font(.subheadline)
+                        }
+                        Text("From \(suggestion.source). AI can be wrong; only accept it if it fits.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Button("Use this answer") {
+                            deviceService.confirmIdentity(uuid: device.uuid ?? "",
+                                                          manufacturer: suggestion.manufacturer,
+                                                          category: suggestion.category,
+                                                          model: suggestion.model)
+                            dismiss()
+                        }
+                        .disabled(suggestion.manufacturer == nil && suggestion.category == .unknown)
+                    }
+                }
+
+                if let errorText {
+                    Section {
+                        Text(errorText).foregroundColor(.red)
+                    }
+                }
+            }
+            .navigationTitle("Ask AI")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if isSending {
+                        ProgressView()
+                    } else {
+                        Button(suggestion == nil ? "Send" : "Ask again") { send() }
+                    }
+                }
+            }
+        }
+    }
+
+    private func send() {
+        isSending = true
+        errorText = nil
+        let text = prompt
+        Task {
+            do {
+                suggestion = try await ai.suggestIdentity(prompt: text)
+            } catch {
+                errorText = error.localizedDescription
+            }
+            isSending = false
         }
     }
 }

@@ -485,9 +485,28 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
         guard let cutoff = Calendar.current.date(byAdding: .day, value: -historyRetentionDays, to: Date()) else { return }
         let request: NSFetchRequest<NSFetchRequestResult> = DeviceDetection.fetchRequest()
         request.predicate = NSPredicate(format: "timestamp < %@", cutoff as NSDate)
-        let delete = NSBatchDeleteRequest(fetchRequest: request)
-        _ = try? viewContext.execute(delete)
-        viewContext.reset()
+        deleteAll(request, wait: false)
+    }
+
+    /// Batch deletes are fast but bypass iCloud sync, so with sync on the
+    /// objects are deleted one by one on a background context instead.
+    private func deleteAll(_ request: NSFetchRequest<NSFetchRequestResult>, wait: Bool) {
+        guard persistenceController.isSyncing else {
+            _ = try? viewContext.execute(NSBatchDeleteRequest(fetchRequest: request))
+            viewContext.reset()
+            return
+        }
+        let context = persistenceController.container.newBackgroundContext()
+        let work = {
+            request.includesPropertyValues = false
+            let objects = (try? context.fetch(request)) as? [NSManagedObject] ?? []
+            for (index, object) in objects.enumerated() {
+                context.delete(object)
+                if index % 500 == 499 { try? context.save() }
+            }
+            try? context.save()
+        }
+        if wait { context.performAndWait(work) } else { context.perform(work) }
     }
 
     // MARK: Device management
@@ -590,8 +609,7 @@ final class DeviceService: ScanEngineDelegate, ObservableObject {
 
     func clearAllData() {
         for entity in ["DeviceDetection", "DeviceLog", "BluetoothDevice"] {
-            let request = NSFetchRequest<NSFetchRequestResult>(entityName: entity)
-            _ = try? viewContext.execute(NSBatchDeleteRequest(fetchRequest: request))
+            deleteAll(NSFetchRequest<NSFetchRequestResult>(entityName: entity), wait: true)
         }
         viewContext.reset()
         liveStore.removeAll()

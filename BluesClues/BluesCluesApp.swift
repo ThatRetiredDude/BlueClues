@@ -12,12 +12,16 @@ struct BluesCluesApp: App {
     let persistenceController = PersistenceController.shared
     // The one DeviceService for the whole app; every tab shares it.
     @StateObject private var deviceService = DeviceService()
+    @StateObject private var aiAssistant = AIAssistant()
+    @StateObject private var cloudSync = CloudSyncMonitor()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(\.managedObjectContext, persistenceController.container.viewContext)
                 .environmentObject(deviceService)
+                .environmentObject(aiAssistant)
+                .environmentObject(cloudSync)
         }
     }
 }

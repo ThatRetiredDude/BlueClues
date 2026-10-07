@@ -36,22 +36,50 @@ struct PersistenceController {
     }()
 
     let container: NSPersistentContainer
+    /// True when this run syncs with iCloud (see CloudSync).
+    let isSyncing: Bool
 
     init(inMemory: Bool = false) {
-        container = NSPersistentContainer(name: "BluesClues")
-        if inMemory {
-            container.persistentStoreDescriptions.first!.url = URL(fileURLWithPath: "/dev/null")
+        // NSPersistentCloudKitContainer behaves like a plain container when no
+        // CloudKit options are set, so the same store works with sync on or off.
+        let container = NSPersistentCloudKitContainer(name: "BluesClues")
+        self.container = container
+        guard let description = container.persistentStoreDescriptions.first else {
+            fatalError("Missing store description")
         }
-        container.persistentStoreDescriptions.first?.shouldMigrateStoreAutomatically = true
-        container.persistentStoreDescriptions.first?.shouldInferMappingModelAutomatically = true
+        if inMemory {
+            description.url = URL(fileURLWithPath: "/dev/null")
+        }
+        description.shouldMigrateStoreAutomatically = true
+        description.shouldInferMappingModelAutomatically = true
+        // Always on, so turning sync on later doesn't need a store rebuild.
+        description.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+        description.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+
+        var syncing = false
+        if !inMemory, CloudSync.shouldSync, let identifier = CloudSync.containerIdentifier {
+            description.cloudKitContainerOptions = NSPersistentCloudKitContainerOptions(containerIdentifier: identifier)
+            syncing = true
+        }
 
         var loadError: Error?
         container.loadPersistentStores { _, error in loadError = error }
 
-        // Older builds shipped an unversioned model, so their stores can't be
-        // migrated. Their data was unreliable anyway: start over with a fresh store.
-        if let error = loadError, !inMemory,
-           let url = container.persistentStoreDescriptions.first?.url {
+        // If CloudKit setup fails, keep the data and run without sync.
+        if loadError != nil, syncing {
+            print("Persistence: iCloud sync unavailable, continuing without it: \(loadError!.localizedDescription)")
+            description.cloudKitContainerOptions = nil
+            syncing = false
+            loadError = nil
+            container.loadPersistentStores { _, error in loadError = error }
+        }
+
+        // Builds before the versioned model shipped an unversioned store that
+        // can't be migrated. Only that case resets the store; any other error
+        // stops the app rather than deleting data.
+        if let error = loadError as NSError?, !inMemory,
+           [NSPersistentStoreIncompatibleVersionHashError, NSMigrationMissingSourceModelError].contains(error.code),
+           let url = description.url {
             print("Persistence: resetting incompatible store: \(error.localizedDescription)")
             try? container.persistentStoreCoordinator.destroyPersistentStore(at: url, ofType: NSSQLiteStoreType, options: nil)
             loadError = nil
@@ -60,6 +88,7 @@ struct PersistenceController {
         if let error = loadError {
             fatalError("Unable to open the BluesClues data store: \(error)")
         }
+        isSyncing = syncing
 
         // Model version 2 replaced the "this is mine" flag with trust levels.
         let upgrade = NSBatchUpdateRequest(entityName: "BluetoothDevice")

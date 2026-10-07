@@ -478,3 +478,70 @@ final class PlaceSeenTests: XCTestCase {
         XCTAssertEqual(places[1].lastSeen, start.addingTimeInterval(60))
     }
 }
+
+final class AIPromptTests: XCTestCase {
+    private let fields = AdvertisementFields(manufacturerData: Data([0x75, 0x00, 0x42, 0x09]),
+                                             serviceUUIDs: ["FE2C"], serviceDataUUIDs: [],
+                                             localName: "Jane's Galaxy Buds", txPower: 7)
+
+    func testPromptContainsBroadcastDataAndGuesses() {
+        let candidates = DeviceIdentifier.candidates(for: fields)
+        let prompt = AIPrompts.devicePrompt(fields: fields, candidates: candidates, includeName: true)
+        XCTAssertTrue(prompt.contains("75 00 42 09"))
+        XCTAssertTrue(prompt.contains("Company ID: 0x0075"))
+        XCTAssertTrue(prompt.contains("FE2C"))
+        XCTAssertTrue(prompt.contains("Jane's Galaxy Buds"))
+        XCTAssertTrue(prompt.contains("Samsung"))
+        XCTAssertTrue(prompt.contains("Tx power: 7 dBm"))
+    }
+
+    func testNameCanBeWithheld() {
+        let prompt = AIPrompts.devicePrompt(fields: fields, candidates: [], includeName: false)
+        XCTAssertFalse(prompt.contains("Jane"))
+        XCTAssertTrue(prompt.contains("(withheld by the user)"))
+    }
+
+    func testPromptHasNoLocationOrSignalStrength() {
+        let prompt = AIPrompts.devicePrompt(fields: fields, candidates: DeviceIdentifier.candidates(for: fields), includeName: true)
+        for word in ["latitude", "longitude", "RSSI", "dBm,", "timestamp"] {
+            XCTAssertFalse(prompt.localizedCaseInsensitiveContains(word), word)
+        }
+    }
+
+    func testParsesFencedJSON() throws {
+        let reply = """
+        Here you go:
+        ```json
+        {"manufacturer": "Samsung", "device_type": "Earbuds or headphones", "model": "Galaxy Buds2 Pro", "confidence": "high", "reasoning": "Samsung ID plus Fast Pair."}
+        ```
+        """
+        let suggestion = try AIPrompts.parseSuggestion(reply, source: "test")
+        XCTAssertEqual(suggestion.manufacturer, "Samsung")
+        XCTAssertEqual(suggestion.category, .earbuds)
+        XCTAssertEqual(suggestion.model, "Galaxy Buds2 Pro")
+        XCTAssertEqual(suggestion.confidence, .high)
+    }
+
+    func testParsesNullsAndUnknownType() throws {
+        let suggestion = try AIPrompts.parseSuggestion(
+            #"{"manufacturer": null, "device_type": "spaceship", "model": "unknown", "confidence": "maybe", "reasoning": ""}"#,
+            source: "test")
+        XCTAssertNil(suggestion.manufacturer)
+        XCTAssertNil(suggestion.model)
+        XCTAssertEqual(suggestion.category, .unknown)
+        XCTAssertEqual(suggestion.confidence, .low)
+    }
+
+    func testUnreadableReplyThrows() {
+        XCTAssertThrowsError(try AIPrompts.parseSuggestion("I think it's a phone.", source: "test"))
+    }
+}
+
+final class CloudSyncTests: XCTestCase {
+    func testSyncIsUnavailableWithoutAContainer() {
+        // Default builds don't set BLUECLUES_CLOUDKIT_CONTAINER.
+        XCTAssertNil(CloudSync.containerIdentifier)
+        XCTAssertFalse(CloudSync.isAvailableInThisBuild)
+        XCTAssertFalse(CloudSync.shouldSync)
+    }
+}
