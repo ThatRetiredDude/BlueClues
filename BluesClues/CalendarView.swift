@@ -10,7 +10,7 @@ import CoreData
 
 struct CalendarView: View {
     @Environment(\.managedObjectContext) private var viewContext
-    @StateObject private var deviceService = DeviceService()
+    @EnvironmentObject private var deviceService: DeviceService
     @State private var selectedDate = Date()
     @State private var selectedDevice: BluetoothDevice?
     @State private var showingDevicePicker = false
@@ -439,5 +439,6 @@ struct CalendarView_Previews: PreviewProvider {
     static var previews: some View {
         CalendarView()
             .environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
+            .environmentObject(DeviceService(persistenceController: .preview, autoStart: false))
     }
 }

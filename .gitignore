@@ -55,7 +55,7 @@ DerivedData/
 *.app
 
 # Test results
-*.plist
+# Info.plist is a real source file (background modes); keep it tracked.
 
 # Logs
 *.log

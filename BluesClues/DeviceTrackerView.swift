@@ -10,8 +10,7 @@ import CoreData
 import Combine
 
 struct DeviceTrackerView: View {
-    @Environment(\.managedObjectContext) private var viewContext
-    @StateObject private var deviceService = DeviceService()
+    @EnvironmentObject private var deviceService: DeviceService
     @State private var selectedDevice: BluetoothDevice?
     @State private var isTracking = false
     @State private var currentRSSI: Int = 0
@@ -19,6 +18,7 @@ struct DeviceTrackerView: View {
     @State private var directionHint: DirectionHint = .none
     @State private var showingDevicePicker = false
     @State private var trackingTimer: Timer?
+    @State private var lastSampleTime: Date?
 
     private let maxHistoryPoints = 50
 
@@ -98,6 +98,7 @@ struct DeviceTrackerView: View {
                             Text("• Closer devices show stronger signals (-30dB to -50dB)")
                             Text("• Distant devices show weaker signals (-70dB to -90dB)")
                             Text("• Use the arrows to guide you toward the device")
+                            Text("• Trackers that change address may drop out for a moment; keep walking")
                         }
                         .font(.subheadline)
                         .foregroundColor(.secondary)
@@ -131,7 +132,7 @@ struct DeviceTrackerView: View {
 
                 Spacer()
             }
-            .navigationTitle("Device Tracker")
+            .navigationTitle("Locate Device")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showingDevicePicker) {
                 DevicePickerView(selectedDevice: $selectedDevice, deviceService: deviceService)
@@ -147,6 +148,7 @@ struct DeviceTrackerView: View {
 
         isTracking = true
         deviceService.startDeviceDiscovery()
+        lastSampleTime = nil
 
         // Set up timer to update signal strength
         trackingTimer?.invalidate() // Cancel any existing timer
@@ -159,29 +161,21 @@ struct DeviceTrackerView: View {
         isTracking = false
         trackingTimer?.invalidate()
         trackingTimer = nil
-        deviceService.stopDeviceDiscovery()
     }
 
     private func updateSignalStrength(for device: BluetoothDevice) {
-        // Get the latest detection for this device
-        let detections = deviceService.getDetectionHistory(forDevice: device, limit: 1)
+        // Live signal straight from the scanner; skip if nothing new was heard.
+        guard let uuid = device.uuid,
+              let live = deviceService.liveDevice(id: uuid),
+              live.lastSeen != lastSampleTime else { return }
+        lastSampleTime = live.lastSeen
 
-        if let latestDetection = detections.first {
-            let newRSSI = Int(latestDetection.rssi)
-            currentRSSI = newRSSI
-
-            // Add to signal history
-            let signalPoint = SignalPoint(timestamp: Date(), rssi: newRSSI)
-            signalHistory.append(signalPoint)
-
-            // Keep only recent history
-            if signalHistory.count > maxHistoryPoints {
-                signalHistory.removeFirst()
-            }
-
-            // Calculate direction hint
-            updateDirectionHint()
+        currentRSSI = live.rssi
+        signalHistory.append(SignalPoint(timestamp: live.lastSeen, rssi: live.rssi))
+        if signalHistory.count > maxHistoryPoints {
+            signalHistory.removeFirst()
         }
+        updateDirectionHint()
     }
 
     private func updateDirectionHint() {
@@ -251,7 +245,7 @@ struct SignalStrengthMeter: View {
                     Image(systemName: getSignalIcon())
                         .font(.system(size: 40))
                         .foregroundColor(getSignalColor())
-                    Text("\(rssi)dB")
+                    Text("\(rssi) dBm")
                         .font(.title)
                         .fontWeight(.bold)
                         .foregroundColor(getSignalColor())
@@ -476,5 +470,6 @@ struct DeviceTrackerView_Previews: PreviewProvider {
     static var previews: some View {
         DeviceTrackerView()
             .environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
+            .environmentObject(DeviceService(persistenceController: .preview, autoStart: false))
     }
 }

@@ -10,7 +10,7 @@ import CoreData
 
 struct LogsView: View {
     @Environment(\.managedObjectContext) private var viewContext
-    @StateObject private var deviceService = DeviceService()
+    @EnvironmentObject private var deviceService: DeviceService
     @State private var selectedDevice: BluetoothDevice?
     @State private var selectedEventType: String?
     @State private var searchText = ""
@@ -107,9 +107,6 @@ struct LogsView: View {
             }
             .navigationTitle("Device Logs")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarItems(trailing: Button("Export") {
-                exportLogs()
-            })
         }
         .onAppear {
             loadLogs()
@@ -210,11 +207,6 @@ struct LogsView: View {
         }
     }
 
-    private func exportLogs() {
-        // In a real app, you'd implement CSV or JSON export
-        print("Export functionality would be implemented here")
-    }
-
     private var calendar: Calendar {
         Calendar.current
     }
@@ -228,7 +220,7 @@ struct FiltersView: View {
     @Binding var endDate: Date
     @ObservedObject var deviceService: DeviceService
 
-    private let eventTypes = ["discovered", "arrived", "departed", "signal_change"]
+    private let eventTypes = ["discovered", "arrived", "departed", "suspicious"]
 
     var body: some View {
         VStack(spacing: 16) {
@@ -366,6 +358,15 @@ struct LogRowView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
+                        if log.hasLocation {
+                            Label(String(format: "%.5f, %.5f", log.latitude, log.longitude), systemImage: "mappin.and.ellipse")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Label("No location", systemImage: "location.slash")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                         Spacer()
                         Image(systemName: "chevron.right")
                             .font(.caption)
@@ -387,7 +388,7 @@ struct LogRowView: View {
             return .green
         case "departed":
             return .red
-        case "signal_change":
+        case "suspicious":
             return .orange
         default:
             return .gray
@@ -444,6 +445,32 @@ struct LogDetailView: View {
                         .background(Color.gray.opacity(0.1))
                         .cornerRadius(8)
                     }
+
+                    // Location
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Location")
+                            .font(.headline)
+                        if log.hasLocation {
+                            PlaceMap(places: [PlaceSeen(latitude: log.latitude, longitude: log.longitude,
+                                                        firstSeen: log.timestamp ?? Date(), lastSeen: log.timestamp ?? Date(),
+                                                        sightings: 1)])
+                                .frame(height: 180)
+                                .cornerRadius(8)
+                            InfoRow(label: "Coordinates", value: String(format: "%.5f, %.5f", log.latitude, log.longitude))
+                            if let url = URL(string: "https://maps.apple.com/?ll=\(log.latitude),\(log.longitude)&q=Logged%20here") {
+                                Link(destination: url) {
+                                    Label("Open in Maps", systemImage: "map")
+                                }
+                            }
+                        } else {
+                            Text("No location was available when this was logged. Older entries and times without a location fix have none.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(8)
 
                     // Log details
                     VStack(alignment: .leading, spacing: 12) {
@@ -509,5 +536,6 @@ struct LogsView_Previews: PreviewProvider {
     static var previews: some View {
         LogsView()
             .environment(\.managedObjectContext, PersistenceController.preview.container.viewContext)
+            .environmentObject(DeviceService(persistenceController: .preview, autoStart: false))
     }
 }
