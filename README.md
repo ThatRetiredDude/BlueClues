@@ -2,9 +2,9 @@
 
 ## Why I built this
 
-While I was in Ukraine, I noticed the same person several times in one day. Each time they were wearing different clothes, so I could never be sure I was actually being followed. Clothes change. The phone, earbuds and watch in someone's pocket usually don't.
+While I was in Kyiv, I thought I was being followed. I noticed the same person several times in one day, but each time they were wearing different clothes, so I couldn't be sure. Clothes change. The phone, earbuds and watch in someone's pocket usually don't.
 
-BlueClues is a personal awareness and safety tool built on that idea. It listens to the Bluetooth devices around you and tells you when the same ones keep turning up.
+So I designed BlueClues to confirm my suspicions. It's a personal awareness and safety tool that listens to the Bluetooth devices around you and tells you when the same ones keep turning up.
 
 ## What it does
 
