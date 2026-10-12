@@ -2,9 +2,15 @@
 
 ## Why I built this
 
-While I was in Kyiv, I thought I was being followed. I noticed the same person several times in one day, but each time they were wearing different clothes, so I couldn't be sure. Clothes change. The phone, earbuds and watch in someone's pocket usually don't.
+Kyiv. One day. The same face, again and again.
 
-So I designed BlueClues to confirm my suspicions. It's a personal awareness and safety tool that listens to the Bluetooth devices around you and tells you when the same ones keep turning up.
+Different clothes every time. The outfit kept changing, but the feeling hadn't. Was I being followed, or was I losing my mind?
+
+I couldn't prove it. So I built something that could.
+
+A person can change their clothes. They don't change the phone in their pocket, the earbuds in their ears or the watch on their wrist. Those devices never stop broadcasting, and BlueClues never stops listening. When the same Bluetooth devices keep turning up around you, from street to street or night after night, BlueClues tells you.
+
+It's a personal awareness and safety tool, designed to turn a gut feeling into evidence.
 
 ## What it does
 
